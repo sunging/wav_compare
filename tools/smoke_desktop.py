@@ -18,6 +18,11 @@ def main():
     parser.add_argument("--seconds", type=int, default=8)
     parser.add_argument("--play", action="store_true")
     parser.add_argument("--screenshot", default=".artifacts/workbench.png")
+    parser.add_argument("--width", type=int, default=1440)
+    parser.add_argument("--height", type=int, default=940)
+    parser.add_argument("--language", choices=("zh", "en"), default="zh")
+    parser.add_argument("--theme", choices=("light", "dark"), default="dark")
+    parser.add_argument("--collapse-panels", action="store_true")
     args = parser.parse_args()
     root = Path(".artifacts/demo")
     root.mkdir(parents=True, exist_ok=True)
@@ -31,9 +36,14 @@ def main():
     app = QtWidgets.QApplication([])
     app.setStyle("Fusion")
     settings = QtCore.QSettings(str(root / "settings.ini"), QtCore.QSettings.IniFormat)
+    settings.clear()
+    settings.setValue("automation/startup", False)
     window = Window((str(root / "reference.wav"), str(root / "candidate.wav")), settings)
-    window.language_combo.setCurrentIndex(window.language_combo.findData("zh"))
-    window.theme_combo.setCurrentIndex(window.theme_combo.findData("dark"))
+    window.resize(args.width, args.height)
+    window.language_combo.setCurrentIndex(window.language_combo.findData(args.language))
+    window.theme_combo.setCurrentIndex(window.theme_combo.findData(args.theme))
+    with QtCore.QSignalBlocker(window.strict):
+        window.strict.setChecked(True)
     result = compare(root / "reference.wav", root / "candidate.wav", Options(strict=True))
     window.set_result(result)
     window.rows = [
@@ -46,6 +56,9 @@ def main():
     ]
     window.populate_rows()
     window.show()
+    if args.collapse_panels:
+        for action in window.panel_actions:
+            action.trigger()
     errors, positions = [], []
     window.player.error.connect(errors.append)
     window.player.position.connect(positions.append)
@@ -64,6 +77,12 @@ def main():
                     "errors": errors,
                     "played_until": max(positions, default=0),
                     "screenshot": str(target.resolve()),
+                    "window_size": [window.width(), window.height()],
+                    "minimum_size_hint": [
+                        window.minimumSizeHint().width(),
+                        window.minimumSizeHint().height(),
+                    ],
+                    "plot_size": [window.tabs.width(), window.tabs.height()],
                 },
                 ensure_ascii=False,
             ),

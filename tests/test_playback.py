@@ -100,6 +100,15 @@ def point(bar, time):
     return QtCore.QPoint(round(bar.x_at(time)), bar.height() // 2)
 
 
+def test_cancel_action_stops_playback_without_analysis_job(window, qtbot):
+    qtbot.waitUntil(lambda: not window.jobs.jobs, timeout=5000)
+    window.play()
+    assert window.player.state == "playing"
+    assert window.cancel_action.isEnabled()
+    window.cancel_action.trigger()
+    assert window.player.state == "stopped"
+
+
 def drag(qtbot, bar, start, end):
     qtbot.mousePress(bar, QtCore.Qt.LeftButton, pos=start)
     for fraction in (0.25, 0.5, 0.75, 1.0):

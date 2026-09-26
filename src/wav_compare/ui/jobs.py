@@ -36,6 +36,7 @@ class Jobs(QtCore.QObject):
     done = QtCore.Signal(str, object)
     progress = QtCore.Signal(float, str)
     idle = QtCore.Signal()
+    activityChanged = QtCore.Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -47,8 +48,11 @@ class Jobs(QtCore.QObject):
         self.sequence = 0
         self.jobs = {}
         self.latest = {}
+        self.accepting = True
 
     def submit(self, kind, function):
+        if not self.accepting:
+            return
         old = self.latest.get(kind)
         if old in self.jobs:
             self.jobs[old].cancel.cancel()
@@ -58,16 +62,19 @@ class Jobs(QtCore.QObject):
         self.jobs[identity] = job
         self.latest[kind] = identity
         self.pool.start(job)
+        self.activityChanged.emit()
 
     def cancel_all(self):
         for job in self.jobs.values():
             job.cancel.cancel()
         self.latest.clear()
+        self.activityChanged.emit()
 
     def cancel_kind(self, kind):
         identity = self.latest.pop(kind, None)
         if identity in self.jobs:
             self.jobs[identity].cancel.cancel()
+        self.activityChanged.emit()
 
     def _progress(self, identity, value, message):
         if identity in self.latest.values():
@@ -76,6 +83,8 @@ class Jobs(QtCore.QObject):
     def _done(self, identity, kind, result):
         self.jobs.pop(identity, None)
         if self.latest.get(kind) == identity:
+            self.latest.pop(kind)
             self.done.emit(kind, result)
+        self.activityChanged.emit()
         if not self.jobs:
             self.idle.emit()
