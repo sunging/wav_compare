@@ -38,6 +38,25 @@ class ByteCache:
         self.size = 0
 
 
+def amplitude_ranges(result: Comparison, channel: int):
+    """Global plot bounds from at most 1024 envelope bins, independent of zoom."""
+    if result.peaks:
+        peaks = np.load(result.peaks[-1][1], mmap_mode="r")
+        try:
+            low = peaks[:, channel, :, 0].min(axis=0)
+            high = peaks[:, channel, :, 1].max(axis=0)
+        finally:
+            peaks._mmap.close()
+    else:
+        raise ValueError("Waveform details are required for plot bounds")
+    maximum = max(abs(low[2]), abs(high[2]))
+    return (
+        (min(0.0, *low[:2]), max(0.0, *high[:2])),
+        (min(0.0, low[2]), max(0.0, high[2])),
+        (0.0, maximum),
+    )
+
+
 def waveform(result: Comparison, begin: float, end: float, channel: int, pixels: int):
     start = max(0, min(result.frames - 1, int(begin * result.rate)))
     stop = min(result.frames, max(start + 1, int(end * result.rate)))

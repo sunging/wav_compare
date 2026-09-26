@@ -16,7 +16,7 @@ from ..cli import channel_pairs
 from ..engine import compare
 from ..models import Options
 from ..reports import export_csv, export_json
-from ..views import ByteCache, spectra, waveform
+from ..views import ByteCache, amplitude_ranges, spectra, waveform
 from .i18n import translate
 from .jobs import Jobs
 from .player import Player
@@ -34,6 +34,7 @@ class Window(QtWidgets.QMainWindow):
         self.language = self.settings.value("language", default_language)
         self.bindings = []
         self.result = None
+        self.spectral_ranges = None
         self.rows = []
         self.detail_cache = OrderedDict()
         self.view_cache = ByteCache()
@@ -153,6 +154,8 @@ class Window(QtWidgets.QMainWindow):
         for plot, weight in ((self.wave_plot, 3), (self.diff_plot, 2), (self.segment_plot, 1)):
             wl.addWidget(plot, weight)
             plot.showGrid(x=True, y=True, alpha=0.18)
+            plot.setMouseEnabled(x=True, y=True)
+            plot.getViewBox().setMouseMode(pg.ViewBox.PanMode)
         self.wave_curves = [
             self.wave_plot.plot(pen=pg.mkPen(c, width=1), name=name)
             for c, name in zip(COLORS[:2], ("A", "B"), strict=True)
@@ -165,6 +168,15 @@ class Window(QtWidgets.QMainWindow):
         self.diff_plot.setXLink(self.wave_plot)
         self.segment_plot.setXLink(self.wave_plot)
         self.region = pg.LinearRegionItem((0, 1), brush=pg.mkBrush(90, 160, 220, 25))
+        # Let drags inside the selection reach the ViewBox; only its edges resize it.
+        self.region.setMovable(False)
+        for line in self.region.lines:
+            line.setMovable(True)
+        self.bind(
+            self.wave_plot,
+            "Drag to pan; drag selection edges to resize the selection.",
+            "setToolTip",
+        )
         self.wave_plot.addItem(self.region, ignoreBounds=True)
         self.cursors = []
         for plot in (self.wave_plot, self.diff_plot):
@@ -186,6 +198,9 @@ class Window(QtWidgets.QMainWindow):
         self.image = pg.ImageItem(axisOrder="row-major")
         self.image.setLookupTable(pg.colormap.get("viridis").getLookupTable())
         self.spectrogram_plot.addItem(self.image)
+        for plot in (self.spectrum_plot, self.spectrogram_plot):
+            plot.setMouseEnabled(x=True, y=True)
+            plot.getViewBox().setMouseMode(pg.ViewBox.PanMode)
         self.tabs.addTab(self.spectrogram_plot, "Spectrogram")
         selection = QtWidgets.QHBoxLayout()
         self.begin, self.end = QtWidgets.QDoubleSpinBox(), QtWidgets.QDoubleSpinBox()
@@ -387,6 +402,7 @@ class Window(QtWidgets.QMainWindow):
         self.jobs.cancel_all()
         self.player.stop()
         self.result = None
+        self.spectral_ranges = None
         self.rows = []
         self.table.setRowCount(0)
         self.detail_cache.clear()
@@ -567,6 +583,7 @@ class Window(QtWidgets.QMainWindow):
 
     def set_result(self, result):
         self.result = result
+        self.spectral_ranges = None
         a, b = result.report["a"], result.report["b"]
         key = (
             a["path"],
@@ -600,7 +617,7 @@ class Window(QtWidgets.QMainWindow):
         for kind in ("view", "hover", "spectrum", "segments", "navigate"):
             self.jobs.cancel_kind(kind)
         self.player.stop()
-        self.redraw_timer.start()
+        self.reset_zoom()
 
     def show_metrics(self):
         if not self.result:
@@ -629,9 +646,25 @@ class Window(QtWidgets.QMainWindow):
     def reset_zoom(self):
         if not self.result:
             return
-        self.wave_plot.setXRange(0, self.result.frames / self.result.rate, padding=0.01)
-        for plot in (self.wave_plot, self.diff_plot, self.segment_plot):
-            plot.enableAutoRange(axis="y", enable=True)
+        duration = self.result.frames / self.result.rate
+        ranges = amplitude_ranges(self.result, max(0, self.channel.currentIndex()))
+        for plot, (low, high) in zip(
+            (self.wave_plot, self.diff_plot, self.segment_plot), ranges, strict=True
+        ):
+            if low == high:
+                low, high = -1.0, 1.0
+            span = high - low
+            plot.setLimits(
+                xMin=0,
+                xMax=duration,
+                minXRange=1 / self.result.rate,
+                yMin=low - span * 0.25,
+                yMax=high + span * 0.25,
+            )
+            # Fixed global bounds avoid viewport refreshes undoing a manual pan.
+            plot.setYRange(low - span * 0.05, high + span * 0.05, padding=0)
+        self.wave_plot.setXRange(0, duration, padding=0)
+        self.reset_spectral_zoom()
         for line in self.cursors:
             line.setPos(0)
         self.hover.clear()
@@ -713,24 +746,48 @@ class Window(QtWidgets.QMainWindow):
         result = self.result
         begin, end, ch = self.begin.value(), self.end.value(), max(0, self.channel.currentIndex())
         fft, hop = int(self.fft.currentText()), self.hop.value()
+        bounds = (
+            max(0, round(begin * result.rate)) / result.rate,
+            min(result.frames, round(end * result.rate)) / result.rate,
+        )
         self.message("Loading…")
         self.jobs.submit(
-            "spectrum", lambda cancel, progress: spectra(result, begin, end, ch, fft, hop, cancel)
+            "spectrum",
+            lambda cancel, progress: (bounds, spectra(result, begin, end, ch, fft, hop, cancel)),
         )
 
     def draw_spectrum(self, value):
-        frequencies, psd, times, images = value
+        (begin, end), (frequencies, psd, times, images) = value
         for curve, data in zip(self.spectrum_curves, psd, strict=True):
             curve.setData(frequencies, data)
+        nyquist = self.result.rate / 2
+        low, high = float(psd.min()), float(psd.max())
+        margin = max(6.0, (high - low) * 0.1)
+        self.spectrum_plot.setLimits(
+            xMin=0, xMax=nyquist, yMin=low - 2 * margin, yMax=high + 2 * margin
+        )
+        self.spectrogram_plot.setLimits(
+            xMin=begin, xMax=end, minXRange=1 / self.result.rate, yMin=0, yMax=nyquist
+        )
+        self.spectral_ranges = (
+            ((0, nyquist), (low - margin, high + margin)),
+            ((begin, end), (0, nyquist)),
+        )
         source = self.source.currentIndex()
         self.image.setImage(images[source], levels=(-120, 0), autoLevels=False)
-        width = max(
-            1 / self.result.rate,
-            (times[-1] - times[0]) if len(times) > 1 else self.end.value() - self.begin.value(),
-        )
-        self.image.setRect(QtCore.QRectF(float(times[0]), 0, width, self.result.rate / 2))
-        self.spectrogram_plot.autoRange()
+        # A single STFT column covers its selection, not a window starting at its center.
+        left, right = (float(times[0]), float(times[-1])) if len(times) > 1 else (begin, end)
+        self.image.setRect(QtCore.QRectF(left, 0, right - left, nyquist))
+        self.reset_spectral_zoom()
         self.message("Complete")
+
+    def reset_spectral_zoom(self):
+        if self.spectral_ranges is None:
+            return
+        for plot, (x_range, y_range) in zip(
+            (self.spectrum_plot, self.spectrogram_plot), self.spectral_ranges, strict=True
+        ):
+            plot.setRange(xRange=x_range, yRange=y_range, padding=0)
 
     def mouse_move(self, event):
         if not self.result or not self.wave_plot.sceneBoundingRect().contains(event[0]):

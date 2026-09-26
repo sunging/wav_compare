@@ -69,6 +69,7 @@ ZH = {
     "Segment differences": "分段差异",
     "Time (s)": "时间（秒）",
     "Amplitude": "幅度",
+    "Drag to pan; drag selection edges to resize the selection.": "按住拖动可平移波形；拖动选区边界可调整选区。",
     "Frequency (Hz)": "频率（Hz）",
     "PSD (dB/Hz)": "功率谱密度（dB/Hz）",
     "Reset zoom": "重置缩放",
