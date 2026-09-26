@@ -20,7 +20,7 @@ Python 3.11 or newer is required. uv can download Python automatically. If the c
 
 After a version has actually been released, append its tag to the Git URL, e.g. `git+https://github.com/sunging/wav_compare.git@v0.1.0`. No PyPI publication or standalone installer is required.
 
-Windows, macOS and Linux are covered by CI. Linux needs a graphical session and Qt system libraries (Debian/Ubuntu: `libegl1 libopengl0 libxkbcommon0`, plus your desktop's Qt/XCB dependencies). Playback needs a working audio device. CLI comparison never opens a window or audio device.
+Windows, macOS and Linux are covered by CI. Linux needs a graphical session and Qt system libraries (Debian/Ubuntu: `libegl1 libopengl0 libxkbcommon0 libpulse0`, plus your desktop's Qt/XCB dependencies). Playback needs a working audio device. CLI comparison never opens a window or audio device.
 
 ## Workbench
 
