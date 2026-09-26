@@ -1,6 +1,10 @@
 """Small explicit UI catalogue; analysis reports use stable English field names."""
 
 ZH = {
+    "Playback timeline": "播放时间轴",
+    "Select all": "选择全部",
+    "No playable audio in selection": "选区内没有可播放的音频",
+    "Click to seek; drag to select; drag edges to resize. Right-click to select all.": "单击定位；拖动建立选区；拖动边界调整范围；右键选择全部。",
     "Show indicator": "显示指示器",
     "Pinned": "已固定",
     "Hover for values; click to pin or unpin. Drag to pan.": "悬停查看数值；单击固定或解除固定；拖动平移。",

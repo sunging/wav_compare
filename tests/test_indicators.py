@@ -172,6 +172,7 @@ def test_disabled_persistence_and_default_enabled(window, qtbot, audio):
     assert not window.indicators["wave"].lines[0].isVisible()
     query(window, qtbot, "diff", 0.15)
     window.close()
+    qtbot.waitUntil(lambda: not window.isVisible(), timeout=5000)
     restored = Window(settings=window.settings)
     qtbot.addWidget(restored)
     assert not restored.indicators["wave"].toggle.isChecked()

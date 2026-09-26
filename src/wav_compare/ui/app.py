@@ -21,6 +21,7 @@ from .i18n import translate
 from .indicator import PlotIndicator
 from .jobs import Jobs
 from .player import Player
+from .timeline import PlaybackTimeline
 
 COLORS = ("#52b9f5", "#ffb454", "#74dbb0")
 
@@ -48,6 +49,7 @@ class Window(QtWidgets.QMainWindow):
         self.player = Player(self)
         self.player.error.connect(self.message)
         self.player.position.connect(self.play_position)
+        self.playback_position = 0.0
         self.setWindowTitle("WAV Compare")
         self.resize(1440, 940)
         self.setMinimumSize(1000, 680)
@@ -174,7 +176,9 @@ class Window(QtWidgets.QMainWindow):
         ]
         self.diff_plot.setXLink(self.wave_plot)
         self.segment_plot.setXLink(self.wave_plot)
-        self.region = pg.LinearRegionItem((0, 1), brush=pg.mkBrush(90, 160, 220, 25))
+        self.region = pg.LinearRegionItem(
+            (0, 1), brush=pg.mkBrush(90, 160, 220, 25), swapMode="block"
+        )
         # Let drags inside the selection reach the ViewBox; only its edges resize it.
         self.region.setMovable(False)
         for line in self.region.lines:
@@ -299,7 +303,7 @@ class Window(QtWidgets.QMainWindow):
         self.loop = self.bind(QtWidgets.QCheckBox(), "Loop selection")
         playback.addWidget(self.original)
         self.button("Play", self.play, playback)
-        self.button("Pause / resume", self.player.pause, playback)
+        self.button("Pause / resume", self.pause_playback, playback)
         self.button("Stop", self.player.stop, playback)
         playback.addWidget(self.loop)
         playback.addWidget(self.label("Volume"))
@@ -308,10 +312,19 @@ class Window(QtWidgets.QMainWindow):
         self.volume.setValue(50)
         self.volume.setMaximumWidth(100)
         playback.addWidget(self.volume)
-        self.seek = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.seek.setRange(0, 10000)
-        playback.addWidget(self.seek, 1)
         layout.addLayout(playback)
+        timeline_row = QtWidgets.QHBoxLayout()
+        self.seek = PlaybackTimeline()
+        self.bind(
+            self.seek,
+            "Click to seek; drag to select; drag edges to resize. Right-click to select all.",
+            "setToolTip",
+        )
+        self.bind(self.seek, "Playback timeline", "setAccessibleName")
+        self.time_label = QtWidgets.QLabel("00:00.000 / 00:00.000")
+        timeline_row.addWidget(self.seek, 1)
+        timeline_row.addWidget(self.time_label)
+        layout.addLayout(timeline_row)
         self.progress_bar = QtWidgets.QProgressBar()
         self.progress_bar.setRange(0, 1000)
         self.progress_bar.setMaximumWidth(180)
@@ -325,7 +338,7 @@ class Window(QtWidgets.QMainWindow):
         for shortcut, callback in (
             ("Ctrl+Return", self.start_compare),
             ("Escape", self.cancel_tasks),
-            ("Space", self.player.pause),
+            ("Space", self.pause_playback),
             ("Ctrl+0", self.reset_zoom),
         ):
             action = QtGui.QShortcut(QtGui.QKeySequence(shortcut), self)
@@ -380,13 +393,19 @@ class Window(QtWidgets.QMainWindow):
         self.language_combo.currentIndexChanged.connect(self.language_changed)
         self.theme_combo.currentIndexChanged.connect(self.apply_theme)
         self.wave_plot.sigXRangeChanged.connect(lambda: self.redraw_timer.start())
-        self.region.sigRegionChangeFinished.connect(self.region_changed)
+        self.region.sigRegionChanged.connect(self.region_changed)
+        self.region.sigRegionChangeFinished.connect(self.selection_committed)
         self.begin.valueChanged.connect(self.spin_region)
         self.end.valueChanged.connect(self.spin_region)
         self.tabs.currentChanged.connect(self.update_spectrum)
         self.source.currentIndexChanged.connect(self.update_spectrum)
         self.volume.valueChanged.connect(lambda n: self.player.set_volume(n / 100))
-        self.seek.sliderReleased.connect(self.seek_play)
+        self.seek.seekRequested.connect(self.seek_play)
+        self.seek.selectionPreview.connect(self.selection_preview)
+        self.seek.selectionCommitted.connect(self.selection_committed)
+        self.loop.toggled.connect(self.selection_committed)
+        self.source.currentIndexChanged.connect(self.playback_source_changed)
+        self.original.toggled.connect(self.playback_source_changed)
 
     def options(self, region=None):
         options = Options(
@@ -412,6 +431,7 @@ class Window(QtWidgets.QMainWindow):
         self.jobs.cancel_all()
         self.player.stop()
         self.result = None
+        self.reset_playback()
         self.spectral_ranges = None
         self.rows = []
         self.table.setRowCount(0)
@@ -549,6 +569,7 @@ class Window(QtWidgets.QMainWindow):
         self.jobs.cancel_all()
         self.player.stop()
         self.result = None
+        self.reset_playback()
         self.view_cache.clear()
         for curve in [
             *self.wave_curves,
@@ -591,6 +612,7 @@ class Window(QtWidgets.QMainWindow):
             self.message(str(error))
 
     def set_result(self, result):
+        self.player.stop()
         self.jobs.cancel_all()
         self.reset_indicators()
         self.spectral_data = None
@@ -617,9 +639,16 @@ class Window(QtWidgets.QMainWindow):
             [f"{m['a_channel']} → {m['b_channel']}" for m in result.report["metrics"]]
         )
         self.channel.blockSignals(False)
+        duration = result.frames / result.rate
+        self.seek.set_duration(duration, result.rate)
+        for control in (self.begin, self.end):
+            with QtCore.QSignalBlocker(control):
+                control.setMaximum(duration)
         self.region.setBounds((0, result.frames / result.rate))
         self.region.setRegion((0, min(10.0, result.frames / result.rate)))
         self.region_changed()
+        self.play_position(0.0)
+        self.update_seek_bounds()
         self.show_metrics()
         self.reset_zoom()
         self.update_spectrum()
@@ -730,14 +759,53 @@ class Window(QtWidgets.QMainWindow):
 
     def region_changed(self):
         lo, hi = self.region.getRegion()
+        if self.result:
+            self.seek.set_selection(lo, hi)
+            lo, hi = self.seek.selection
+            if (lo, hi) != self.region.getRegion():
+                with QtCore.QSignalBlocker(self.region):
+                    self.region.setRegion((lo, hi))
         for control, value in ((self.begin, lo), (self.end, hi)):
             blocker = QtCore.QSignalBlocker(control)
             control.setValue(value)
             del blocker
+        self.update_seek_bounds()
 
     def spin_region(self):
-        if self.begin.value() < self.end.value():
-            self.region.setRegion((self.begin.value(), self.end.value()))
+        if not self.result:
+            return
+        lo, hi = self.begin.value(), self.end.value()
+        step = self.seek.step
+        if self.sender() is self.begin:
+            lo = min(lo, hi - step)
+        else:
+            hi = max(hi, lo + step)
+        self.selection_preview(lo, hi)
+        self.selection_committed()
+
+    def selection_preview(self, lo, hi):
+        if not self.result:
+            return
+        self.seek.set_selection(lo, hi)
+        with QtCore.QSignalBlocker(self.region):
+            self.region.setRegion(self.seek.selection)
+        self.region_changed()
+
+    def selection_committed(self, *_):
+        if not self.result:
+            return
+        self.region_changed()
+        self.update_seek_bounds()
+        if self.loop.isChecked():
+            lo, hi = self.seek.seek_bounds
+            position = self.playback_position
+            if not lo <= position < hi:
+                position = lo
+            self.seek_play(position)
+        elif self.player.state != "stopped" and self.player.loop:
+            self.seek_play(self.playback_position)
+        else:
+            self.play_position(self.playback_position)
 
     def analyze_region(self, selected):
         if not self.result:
@@ -865,7 +933,9 @@ class Window(QtWidgets.QMainWindow):
             return
         frequencies, psd, times, images = self.spectral_data
         if name == "spectrum":
-            if not frequencies[0] <= point.x() <= frequencies[-1]:
+            # Scene/view transforms can round an exact endpoint a few ULPs outward.
+            tolerance = np.finfo(float).eps * max(1.0, abs(frequencies[-1])) * 8
+            if not frequencies[0] - tolerance <= point.x() <= frequencies[-1] + tolerance:
                 return
             index = int(np.abs(frequencies - point.x()).argmin())
             fields.append(("Frequency", f"{frequencies[index]:.9g} Hz"))
@@ -942,30 +1012,103 @@ class Window(QtWidgets.QMainWindow):
 
         self.jobs.submit("navigate", find)
 
-    def play(self, begin=None):
+    def reset_playback(self):
+        self.seek.set_duration(0, 1)
+        self.playback_position = 0.0
+        self.time_label.setText("00:00.000 / 00:00.000")
+        for line in self.cursors:
+            line.setPos(0)
+
+    def playback_bounds(self):
+        if not self.result:
+            return 0.0, 0.0
+        duration = self.result.frames / self.result.rate
+        if self.original.isChecked() and self.source.currentIndex() in (0, 1):
+            info = self.result.report["a" if self.source.currentIndex() == 0 else "b"]
+            duration = min(duration, info["frames"] / info["samplerate"])
+        lo, hi = self.seek.selection if self.loop.isChecked() else (0.0, duration)
+        return lo, min(hi, duration)
+
+    def update_seek_bounds(self):
+        lo, hi = self.playback_bounds()
+        self.seek.seek_bounds = (lo, max(lo, hi))
+
+    def playback_source_changed(self, *_):
+        self.player.stop()
+        self.update_seek_bounds()
         if self.result:
-            start = self.begin.value() if begin is None or isinstance(begin, bool) else begin
-            self.player.play(
-                self.result,
-                self.source.currentIndex(),
-                max(0, self.channel.currentIndex()),
-                start,
-                self.end.value(),
-                self.loop.isChecked(),
-                self.original.isChecked(),
-            )
+            self.seek_play(self.playback_position)
+
+    def start_playback(self, position, paused=False):
+        lo, hi = self.playback_bounds()
+        rate = self.result.rate
+        if self.original.isChecked() and self.source.currentIndex() in (0, 1):
+            rate = self.result.report["a" if self.source.currentIndex() == 0 else "b"]["samplerate"]
+        if round(hi * rate) <= round(lo * rate):
+            self.player.stop()
+            self.message("No playable audio in selection")
+            return
+        # A loop's end is exclusive; seeking there starts the next iteration.
+        at_end = round(position * rate) >= round(hi * rate)
+        if self.loop.isChecked() and at_end:
+            position = lo
+        elif at_end:
+            self.player.park(hi, paused=paused)
+            return
+        self.player.play(
+            self.result,
+            self.source.currentIndex(),
+            max(0, self.channel.currentIndex()),
+            max(lo, position),
+            hi,
+            self.loop.isChecked(),
+            self.original.isChecked(),
+            loop_begin=lo,
+            paused=paused,
+        )
+
+    def play(self, *_):
+        if not self.result:
+            return
+        lo, hi = self.playback_bounds()
+        position = self.playback_position
+        if not lo <= position < hi:
+            position = lo
+        self.start_playback(position)
+
+    def pause_playback(self):
+        if self.player.state == "paused" and self.player.sink is None:
+            self.play()
+        else:
+            self.player.pause()
 
     def play_position(self, seconds):
         if self.result:
-            self.seek.setValue(round(seconds / (self.result.frames / self.result.rate) * 10000))
-            for line in self.cursors:
-                line.setPos(seconds)
+            self.playback_position = max(0.0, min(seconds, self.seek.duration))
+            if self.seek.interacting:
+                return
+            self.seek.set_position(self.playback_position)
 
-    def seek_play(self):
-        if self.result:
-            position = self.seek.value() / 10000 * self.result.frames / self.result.rate
-            if position < self.end.value():
-                self.play(position)
+            def format_time(value):
+                millis = round(value * 1000)
+                minutes, millis = divmod(millis, 60000)
+                return f"{minutes:02d}:{millis // 1000:02d}.{millis % 1000:03d}"
+
+            self.time_label.setText(
+                f"{format_time(self.playback_position)} / {format_time(self.seek.duration)}"
+            )
+            for line in self.cursors:
+                line.setPos(self.playback_position)
+
+    def seek_play(self, position):
+        if not self.result:
+            return
+        lo, hi = self.playback_bounds()
+        position = max(lo, min(position, hi))
+        state = self.player.state
+        self.play_position(position)
+        if state != "stopped":
+            self.start_playback(position, paused=state == "paused")
 
     def export(self, kind):
         rows = self.rows
@@ -1003,6 +1146,7 @@ class Window(QtWidgets.QMainWindow):
         self.retranslate()
 
     def retranslate(self):
+        self.seek.select_all_text = self.tr("Select all")
         for indicator in self.indicators.values():
             indicator.retranslate()
         for widget, text, method in self.bindings:
@@ -1043,6 +1187,7 @@ class Window(QtWidgets.QMainWindow):
         )
         for indicator in self.indicators.values():
             indicator.apply_theme(dark)
+        self.seek.apply_theme(dark)
         self.setStyleSheet(f"""
             QMainWindow, QWidget {{ background: {bg}; color: {fg}; font-size: 12px; }}
             QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QPlainTextEdit, QTableWidget {{
@@ -1087,9 +1232,11 @@ class Window(QtWidgets.QMainWindow):
     def closeEvent(self, event):
         self.reset_indicators()
         self.player.stop()
-        if self.jobs.jobs:
+        if self.jobs.jobs or self.player.has_workers():
             self.closing = True
             self.jobs.cancel_all()
+            if self.player.has_workers():
+                QtCore.QTimer.singleShot(50, self.close)
             self.message("Closing after background tasks stop…")
             event.ignore()
             return

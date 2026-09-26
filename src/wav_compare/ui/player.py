@@ -15,11 +15,13 @@ from ..audio import read_range
 class Player(QtCore.QObject):
     error = QtCore.Signal(str)
     position = QtCore.Signal(float)
+    stateChanged = QtCore.Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.sink = None
         self.producer = None
+        self.workers = []
         self.cancel = threading.Event()
         self.timer = QtCore.QTimer(self)
         self.timer.setInterval(15)
@@ -27,9 +29,48 @@ class Player(QtCore.QObject):
         self.pending = b""
         self.paused = False
         self.volume = 0.5
+        self.state = "stopped"
 
-    def play(self, result, source, channel, begin, end, loop=False, original=False):
+    def _set_state(self, state):
+        self.paused = state == "paused"
+        if self.state != state:
+            self.state = state
+            self.stateChanged.emit(state)
+
+    def play(
+        self,
+        result,
+        source,
+        channel,
+        begin,
+        end,
+        loop=False,
+        original=False,
+        *,
+        loop_begin=None,
+        paused=False,
+    ):
         self.stop()
+        rate = result.rate
+        limit = result.frames / rate
+        if original and source in (0, 1):
+            info = result.report["a" if source == 0 else "b"]
+            rate = info["samplerate"]
+            limit = min(limit, info["frames"] / rate)
+        end = min(end, limit)
+        loop_begin = begin if loop_begin is None else loop_begin
+        if round(end * rate) <= round(max(0, loop_begin if loop else begin) * rate):
+            self.error.emit("No playable audio in selection")
+            return
+        begin = max(0, begin)
+        loop_begin = max(0, loop_begin)
+        if loop:
+            begin = max(loop_begin, min(begin, end))
+            if round(begin * rate) >= round(end * rate):
+                begin = loop_begin
+        elif round(begin * rate) >= round(end * rate):
+            self.error.emit("No playable audio in selection")
+            return
         device = QtMultimedia.QMediaDevices.defaultAudioOutput()
         if device.isNull():
             self.error.emit("No audio output device")
@@ -50,19 +91,53 @@ class Player(QtCore.QObject):
             self.error.emit("Cannot open audio output device")
             self.stop()
             return
+        # No PCM is queued or written before suspension, including paused seeks.
+        if paused:
+            self.sink.suspend()
         self.queue = queue.Queue(maxsize=8)
         self.cancel = threading.Event()
         self.origin, self.end = begin, end
+        self.loop_begin = loop_begin
         self.loop = loop
         self.finished = False
-        self.paused = False
         self.pending = b""
-        args = result, source, channel, begin, end, loop, original, fmt, self.queue, self.cancel
+        self._set_state("paused" if paused else "playing")
+        self.position.emit(begin)
+        args = (
+            result,
+            source,
+            channel,
+            begin,
+            end,
+            loop,
+            original,
+            fmt,
+            self.queue,
+            self.cancel,
+            loop_begin,
+        )
         self.producer = threading.Thread(target=self._produce, args=args, daemon=True)
+        self.workers = [worker for worker in self.workers if worker.is_alive()]
+        self.workers.append(self.producer)
         self.producer.start()
         self.timer.start()
 
-    def _produce(self, result, source, channel, begin, end, loop, original, fmt, output, cancel):
+    def _produce(
+        self,
+        result,
+        source,
+        channel,
+        begin,
+        end,
+        loop,
+        original,
+        fmt,
+        output,
+        cancel,
+        loop_begin=None,
+    ):
+        loop_begin = begin if loop_begin is None else loop_begin
+
         def put(value):
             while not cancel.is_set():
                 try:
@@ -116,6 +191,7 @@ class Player(QtCore.QObject):
                         return
                 if not loop:
                     break
+                begin = loop_begin
             put(None)
         except Exception as error:
             put(str(error))
@@ -142,15 +218,20 @@ class Player(QtCore.QObject):
                         raise OSError("Audio output write failed")
                     self.pending = self.pending[written:]
             elapsed = self.sink.processedUSecs() / 1e6
-            duration = max(0.001, self.end - self.origin)
-            self.position.emit(
-                self.origin + (elapsed % duration if self.loop else min(elapsed, duration))
-            )
+            first_duration = self.end - self.origin
+            if self.loop and elapsed >= first_duration:
+                seconds = self.loop_begin + (
+                    (elapsed - first_duration) % (self.end - self.loop_begin)
+                )
+            else:
+                seconds = self.origin + min(elapsed, first_duration)
+            self.position.emit(seconds)
             if (
                 self.finished
                 and not self.pending
                 and self.sink.state() == QtMultimedia.QAudio.IdleState
             ):
+                self.position.emit(self.end)
                 self.stop()
         except queue.Empty:
             pass
@@ -160,20 +241,33 @@ class Player(QtCore.QObject):
 
     def pause(self):
         if self.sink:
-            self.paused = not self.paused
-            self.sink.suspend() if self.paused else self.sink.resume()
+            paused = not self.paused
+            self.sink.suspend() if paused else self.sink.resume()
+            self._set_state("paused" if paused else "playing")
+
+    def park(self, seconds, paused=False):
+        """Keep an end position without opening an empty audio stream."""
+        self.stop()
+        self.position.emit(seconds)
+        if paused:
+            self._set_state("paused")
 
     def set_volume(self, value):
         self.volume = value
         if self.sink:
             self.sink.setVolume(value)
 
+    def has_workers(self):
+        return any(worker.is_alive() for worker in self.workers)
+
     def stop(self):
         self.cancel.set()
         self.timer.stop()
         if self.sink:
-            self.sink.stop()
+            # Discard buffered PCM immediately; stop() may drain it on some backends.
+            self.sink.reset()
             self.sink.deleteLater()
             self.sink = None
         # Producer owns result until it observes cancellation; never delete its cache early.
         self.pending = b""
+        self._set_state("stopped")

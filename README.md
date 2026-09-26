@@ -35,7 +35,9 @@ Windows, macOS and Linux are covered by CI. Linux needs a graphical session and 
 - Switch English/Chinese and system/light/dark themes. Paths, options and layout are saved locally.
 - Export versioned JSON or CSV. Single-file export reflects the current selection analysis; directory export contains the complete batch.
 
-Keyboard: **Ctrl+Enter** compare, **Esc** cancel, **Ctrl+0** reset zoom, **Space** pause/resume. The seek bar restarts playback at a position inside the selection. Original-input playback uses each source's original seconds; processed playback follows the aligned timeline.
+The playback timeline supports click-to-seek, dragging in either direction to select, dragging selection edges to resize, and **Select all** in its context menu. Selection stays synchronized with the waveform and time inputs. Seeking preserves playing, paused or stopped state; Stop keeps the position. Without looping, playback continues to the audio end; with looping, it stays inside the selection. Seeking into a loop plays its remainder first, then repeats the entire selection. Playing again at the end restarts from the beginning. Changing the source stops playback. Original-input playback uses each source's original seconds and is limited to that file's end; processed playback follows the aligned timeline.
+
+Keyboard: **Ctrl+Enter** compare, **Esc** cancel, **Ctrl+0** reset zoom, **Space** pause/resume. With the timeline focused, **Left/Right** seek by 0.1 seconds and **Home/End** seek to the effective playback bounds.
 
 ## Command line
 
