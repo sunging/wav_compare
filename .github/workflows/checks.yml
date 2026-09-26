@@ -1,0 +1,62 @@
+name: Checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        default: ''
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ['3.12']
+        include:
+          - os: ubuntu-latest
+            python: '3.11'
+    runs-on: ${{ matrix.os }}
+    env:
+      QT_QPA_PLATFORM: offscreen
+      QT_LOGGING_RULES: 'qt.multimedia.*=false'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libopengl0 libxkbcommon0
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run python tools/check_version.py
+      - run: uv run pytest -q -W error::pytest.PytestUnraisableExceptionWarning
+      - run: uv build
+      - name: Install wheel as an isolated tool
+        shell: bash
+        run: |
+          uv tool install --python '${{ matrix.python }}' "$(find dist -name '*.whl' -print -quit)"
+          cd "$RUNNER_TEMP"
+          "$(uv tool dir --bin)/wav-compare" --version
+          "$(uv tool dir --bin)/wav-compare" --help
+  title:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a Conventional Commit title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          python - <<'PY'
+          import os, re
+          assert re.match(r'^(feat|fix|perf|deps|docs|refactor|test|build|ci|chore|revert)(\([^\r\n]+\))?!?: .+', os.environ['PR_TITLE']), 'Use a Conventional Commit PR title'
+          PY

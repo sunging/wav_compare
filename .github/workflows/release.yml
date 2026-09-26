@@ -1,0 +1,90 @@
+name: Release preparation
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+jobs:
+  main-checks:
+    uses: ./.github/workflows/checks.yml
+    with:
+      ref: ${{ github.sha }}
+  prepare:
+    needs: main-checks
+    runs-on: ubuntu-latest
+    outputs:
+      release_ref: ${{ steps.lock.outputs.ref }}
+    steps:
+      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          skip-github-release: true
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          python-version: '3.12'
+      - name: Synchronize only the release PR lockfile
+        id: lock
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch=$(gh pr list --state open --label 'autorelease: pending' --json headRefName --jq '.[0].headRefName // empty')
+          if [ -z "$branch" ]; then exit 0; fi
+          case "$branch" in release-please--*) ;; *) echo 'Unexpected release branch'; exit 1;; esac
+          git fetch origin "$branch"
+          git checkout -B "$branch" "origin/$branch"
+          uv lock
+          uv run python tools/check_version.py
+          if ! git diff --quiet -- uv.lock; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add uv.lock
+            git commit -m 'chore: synchronize release lockfile'
+            git push origin "$branch"
+          fi
+          echo "ref=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+  release-pr-checks:
+    needs: prepare
+    if: needs.prepare.outputs.release_ref != ''
+    uses: ./.github/workflows/checks.yml
+    with:
+      ref: ${{ needs.prepare.outputs.release_ref }}
+  publish:
+    # Only merged release PRs are published. Preparing one never merges it.
+    needs: [main-checks, prepare]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          skip-github-pull-request: true
+      - if: steps.release.outputs.release_created == 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.release.outputs.sha }}
+      - if: steps.release.outputs.release_created == 'true'
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          python-version: '3.12'
+      - name: Verify and attach distributions
+        if: steps.release.outputs.release_created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag_name }}
+        run: |
+          uv sync --locked
+          uv run python tools/check_version.py --tag "$RELEASE_TAG"
+          uv build
+          gh release upload "$RELEASE_TAG" dist/* --clobber
