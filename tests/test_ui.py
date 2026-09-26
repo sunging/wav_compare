@@ -40,6 +40,7 @@ def test_plot_drag_and_limits(qtbot, audio, tmp_path, plot_name):
     selection = window.region.getRegion()
     start = plot.mapFromScene(box.sceneBoundingRect().center())
     drag(qtbot, plot, start, start + QtCore.QPoint(25, 20))
+    assert not any(indicator.fixed for indicator in window.indicators.values())
     after = np.array(box.viewRange())
     assert not np.allclose(before[0], after[0]), "Time must pan inside the selection"
     assert not np.allclose(before[1], after[1]), "Amplitude must pan inside the selection"
@@ -71,6 +72,7 @@ def test_plot_drag_and_limits(qtbot, audio, tmp_path, plot_name):
         start = plot.mapFromScene(box.mapViewToScene(QtCore.QPointF(0.5, 0)))
         end = plot.mapFromScene(box.mapViewToScene(QtCore.QPointF(0.7, 0)))
         drag(qtbot, plot, start, end)
+        assert not window.indicators["wave"].fixed
         assert window.region.getRegion()[0] > 0.6
         assert window.begin.value() == pytest.approx(window.region.getRegion()[0], abs=1e-6)
     window.jobs.cancel_all()
@@ -134,6 +136,7 @@ def test_spectral_drag_limits_and_reset(qtbot, audio, tmp_path, rate, plot_name,
     before = np.array(box.viewRange())
     start = plot.mapFromScene(box.sceneBoundingRect().center())
     drag(qtbot, plot, start, start + QtCore.QPoint(20, 20))
+    assert not any(indicator.fixed for indicator in window.indicators.values())
     assert not np.allclose(before[0], box.viewRange()[0])
     assert not np.allclose(before[1], box.viewRange()[1])
     for direction in (-1, 1):

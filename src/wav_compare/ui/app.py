@@ -18,6 +18,7 @@ from ..models import Options
 from ..reports import export_csv, export_json
 from ..views import ByteCache, amplitude_ranges, spectra, waveform
 from .i18n import translate
+from .indicator import PlotIndicator
 from .jobs import Jobs
 from .player import Player
 
@@ -35,6 +36,7 @@ class Window(QtWidgets.QMainWindow):
         self.bindings = []
         self.result = None
         self.spectral_ranges = None
+        self.spectral_data = None
         self.rows = []
         self.detail_cache = OrderedDict()
         self.view_cache = ByteCache()
@@ -149,10 +151,15 @@ class Window(QtWidgets.QMainWindow):
         self.wave_plot = pg.PlotWidget()
         self.diff_plot = pg.PlotWidget()
         self.segment_plot = pg.PlotWidget()
+        self.indicators = {}
         self.wave_plot.addLegend(offset=(8, 8))
         self.segment_plot.addLegend(offset=(8, 8))
-        for plot, weight in ((self.wave_plot, 3), (self.diff_plot, 2), (self.segment_plot, 1)):
-            wl.addWidget(plot, weight)
+        for plot, weight in ((self.wave_plot, 3), (self.diff_plot, 2), (self.segment_plot, 2)):
+            plot.setMinimumHeight(120)
+            name = {self.wave_plot: "wave", self.diff_plot: "diff", self.segment_plot: "segment"}[
+                plot
+            ]
+            wl.addWidget(self.add_indicator(name, plot), weight)
             plot.showGrid(x=True, y=True, alpha=0.18)
             plot.setMouseEnabled(x=True, y=True)
             plot.getViewBox().setMouseMode(pg.ViewBox.PanMode)
@@ -183,17 +190,19 @@ class Window(QtWidgets.QMainWindow):
             line = pg.InfiniteLine(angle=90, pen=pg.mkPen("#c6a0f6", style=QtCore.Qt.DashLine))
             plot.addItem(line, ignoreBounds=True)
             self.cursors.append(line)
-        self.hover = QtWidgets.QLabel()
-        self.hover.setMinimumHeight(22)
-        wl.addWidget(self.hover)
-        self.tabs.addTab(wave_page, "Waveform")
+        wave_scroll = QtWidgets.QScrollArea()
+        wave_scroll.setWidgetResizable(True)
+        wave_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        wave_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        wave_scroll.setWidget(wave_page)
+        self.tabs.addTab(wave_scroll, "Waveform")
         self.spectrum_plot = pg.PlotWidget()
         self.spectrum_plot.addLegend()
         self.spectrum_curves = [
             self.spectrum_plot.plot(pen=color, name=name)
             for color, name in zip(COLORS, ("A", "B", "B − A"), strict=True)
         ]
-        self.tabs.addTab(self.spectrum_plot, "Spectrum")
+        self.tabs.addTab(self.add_indicator("spectrum", self.spectrum_plot), "Spectrum")
         self.spectrogram_plot = pg.PlotWidget()
         self.image = pg.ImageItem(axisOrder="row-major")
         self.image.setLookupTable(pg.colormap.get("viridis").getLookupTable())
@@ -201,7 +210,7 @@ class Window(QtWidgets.QMainWindow):
         for plot in (self.spectrum_plot, self.spectrogram_plot):
             plot.setMouseEnabled(x=True, y=True)
             plot.getViewBox().setMouseMode(pg.ViewBox.PanMode)
-        self.tabs.addTab(self.spectrogram_plot, "Spectrogram")
+        self.tabs.addTab(self.add_indicator("spectrogram", self.spectrogram_plot), "Spectrogram")
         selection = QtWidgets.QHBoxLayout()
         self.begin, self.end = QtWidgets.QDoubleSpinBox(), QtWidgets.QDoubleSpinBox()
         for text, control in (("Selection start (s)", self.begin), ("Selection end (s)", self.end)):
@@ -313,9 +322,6 @@ class Window(QtWidgets.QMainWindow):
         self.redraw_timer.setSingleShot(True)
         self.redraw_timer.setInterval(50)
         self.redraw_timer.timeout.connect(self.redraw)
-        self.mouse_proxy = pg.SignalProxy(
-            self.wave_plot.scene().sigMouseMoved, rateLimit=15, slot=self.mouse_move
-        )
         for shortcut, callback in (
             ("Ctrl+Return", self.start_compare),
             ("Escape", self.cancel_tasks),
@@ -326,6 +332,8 @@ class Window(QtWidgets.QMainWindow):
             action.activated.connect(callback)
 
     def _restore(self, paths):
+        for name, indicator in self.indicators.items():
+            indicator.toggle.setChecked(self.settings.value(f"indicators/{name}", True, type=bool))
         for i, edit in enumerate(self.paths):
             edit.setText(paths[i] if len(paths) == 2 else self.settings.value(f"path{i}", ""))
         self.language_combo.setCurrentIndex(self.language_combo.findData(self.language))
@@ -399,6 +407,8 @@ class Window(QtWidgets.QMainWindow):
         return options
 
     def invalidate(self, *_):
+        self.reset_indicators()
+        self.spectral_data = None
         self.jobs.cancel_all()
         self.player.stop()
         self.result = None
@@ -416,7 +426,6 @@ class Window(QtWidgets.QMainWindow):
             curve.setData([], [])
         self.image.clear()
         self.metrics.clear()
-        self.hover.clear()
         self.message("Settings changed; compare again.")
 
     def browse(self, side, folder):
@@ -497,12 +506,9 @@ class Window(QtWidgets.QMainWindow):
             x, maxes, means = value
             self.segment_curves[0].setData(x, maxes)
             self.segment_curves[1].setData(x, means)
-        elif kind == "hover":
-            sample, values = value
-            self.hover.setText(
-                f"t={sample / self.result.rate:.6f} s   n={sample}   "
-                f"A={values[0]:.9g}   B={values[1]:.9g}   Δ={values[2]:.9g}"
-            )
+        elif kind.startswith("indicator:"):
+            revision, x, fields = value
+            self.indicators[kind.split(":", 1)[1]].finish(revision, x, fields)
         elif kind == "navigate":
             if value is not None:
                 self.zoom_to(value)
@@ -552,7 +558,8 @@ class Window(QtWidgets.QMainWindow):
         ]:
             curve.setData([], [])
         self.image.clear()
-        self.hover.clear()
+        self.reset_indicators()
+        self.spectral_data = None
         if row["status"] in ("missing", "collision"):
             self.metrics.setPlainText(json.dumps(row, ensure_ascii=False, indent=2))
             return
@@ -572,6 +579,8 @@ class Window(QtWidgets.QMainWindow):
             self.jobs.cancel_all()
             self.player.stop()
             self.result = None
+            self.reset_indicators()
+            self.spectral_data = None
             if cached:
                 self.set_result(cached)
             else:
@@ -582,6 +591,9 @@ class Window(QtWidgets.QMainWindow):
             self.message(str(error))
 
     def set_result(self, result):
+        self.jobs.cancel_all()
+        self.reset_indicators()
+        self.spectral_data = None
         self.result = result
         self.spectral_ranges = None
         a, b = result.report["a"], result.report["b"]
@@ -614,7 +626,9 @@ class Window(QtWidgets.QMainWindow):
         self.message("Complete")
 
     def channel_changed(self):
-        for kind in ("view", "hover", "spectrum", "segments", "navigate"):
+        self.reset_indicators()
+        self.spectral_data = None
+        for kind in ("view", "spectrum", "segments", "navigate"):
             self.jobs.cancel_kind(kind)
         self.player.stop()
         self.reset_zoom()
@@ -644,6 +658,7 @@ class Window(QtWidgets.QMainWindow):
         self.metrics.setPlainText(text)
 
     def reset_zoom(self):
+        self.reset_indicators()
         if not self.result:
             return
         duration = self.result.frames / self.result.rate
@@ -667,7 +682,6 @@ class Window(QtWidgets.QMainWindow):
         self.reset_spectral_zoom()
         for line in self.cursors:
             line.setPos(0)
-        self.hover.clear()
         self.redraw_timer.start()
 
     def redraw(self):
@@ -741,6 +755,9 @@ class Window(QtWidgets.QMainWindow):
         )
 
     def update_spectrum(self, *_):
+        self.reset_indicators(("spectrum", "spectrogram"))
+        self.spectral_data = None
+        self.jobs.cancel_kind("spectrum")
         if not self.result or self.tabs.currentIndex() == 0:
             return
         result = self.result
@@ -758,6 +775,8 @@ class Window(QtWidgets.QMainWindow):
 
     def draw_spectrum(self, value):
         (begin, end), (frequencies, psd, times, images) = value
+        self.reset_indicators(("spectrum", "spectrogram"))
+        self.spectral_data = (frequencies, psd, times, images)
         for curve, data in zip(self.spectrum_curves, psd, strict=True):
             curve.setData(frequencies, data)
         nyquist = self.result.rate / 2
@@ -789,23 +808,91 @@ class Window(QtWidgets.QMainWindow):
         ):
             plot.setRange(xRange=x_range, yRange=y_range, padding=0)
 
-    def mouse_move(self, event):
-        if not self.result or not self.wave_plot.sceneBoundingRect().contains(event[0]):
+    def add_indicator(self, name, plot):
+        indicator = PlotIndicator(plot, self.tr, crosshair=name == "spectrogram")
+        self.indicators[name] = indicator
+        indicator.requested.connect(lambda revision, point: self.probe(name, revision, point))
+        indicator.invalidated.connect(lambda: self.jobs.cancel_kind(f"indicator:{name}"))
+        return indicator.panel
+
+    def reset_indicators(self, names=None):
+        for name in self.indicators if names is None else names:
+            self.indicators[name].reset()
+
+    def probe(self, name, revision, point):
+        if not self.result:
             return
-        point = self.wave_plot.plotItem.vb.mapSceneToView(event[0])
+        indicator = self.indicators[name]
         result, channel = self.result, max(0, self.channel.currentIndex())
-        index = int(point.x() * result.rate)
-        if not 0 <= index < result.frames:
+        fields = [("Display channel", self.channel.currentText())]
+        if name in ("wave", "diff", "segment"):
+            if not 0 <= point.x() < result.frames / result.rate:
+                return
+            sample = int(point.x() * result.rate)
+            indicator.accept(revision)
+
+            def read(cancel, progress):
+                cancel.check()
+                if name == "segment":
+                    width = result.options.segment_size
+                    index = sample // width
+                    maximum, total, _, count = result.segment_data()[index, channel]
+                    start, stop = index * width, min(result.frames, (index + 1) * width)
+                    details = [
+                        ("Segment index (0-based)", str(index)),
+                        ("Time range", f"[{start / result.rate:.6f}, {stop / result.rate:.6f}) s"),
+                        ("Sample count", str(int(count))),
+                        ("Max absolute difference", f"{maximum:.9g}"),
+                        ("MAE", f"{total / max(1, count):.9g}"),
+                    ]
+                else:
+                    a, b, difference = (float(v[0, channel]) for v in result.samples(sample, 1))
+                    details = [
+                        ("Time", f"{sample / result.rate:.6f} s"),
+                        ("Sample index (0-based)", str(sample)),
+                    ]
+                    if name == "wave":
+                        details.extend((("A", f"{a:.9g}"), ("B", f"{b:.9g}")))
+                    details.append(("B − A", f"{difference:.9g}"))
+                    if name == "diff":
+                        details.append(("Absolute difference", f"{abs(difference):.9g}"))
+                cancel.check()
+                return revision, sample / result.rate, fields + details
+
+            self.jobs.submit(f"indicator:{name}", read)
             return
-        for line in self.cursors:
-            line.setPos(index / result.rate)
-        self.jobs.submit(
-            "hover",
-            lambda cancel, progress: (
-                index,
-                tuple(float(v[0, channel]) for v in result.samples(index, 1)),
-            ),
-        )
+        if self.spectral_data is None:
+            return
+        frequencies, psd, times, images = self.spectral_data
+        if name == "spectrum":
+            if not frequencies[0] <= point.x() <= frequencies[-1]:
+                return
+            index = int(np.abs(frequencies - point.x()).argmin())
+            fields.append(("Frequency", f"{frequencies[index]:.9g} Hz"))
+            fields.extend(
+                (label, f"{psd[k, index]:.9g} dB/Hz") for k, label in enumerate(("A", "B", "B − A"))
+            )
+            indicator.accept(revision)
+            indicator.finish(revision, float(frequencies[index]), fields)
+        else:
+            pixel = self.image.mapFromParent(point)
+            rows, columns = images.shape[1:]
+            if not (0 <= pixel.x() <= columns and 0 <= pixel.y() <= rows):
+                return
+            column, row = min(int(pixel.x()), columns - 1), min(int(pixel.y()), rows - 1)
+            source = self.source.currentIndex()
+            fields.extend(
+                (
+                    ("Source", self.source.currentText()),
+                    ("Frame time", f"{times[column]:.6f} s"),
+                    ("Frequency", f"{frequencies[row]:.9g} Hz"),
+                    ("Amplitude", f"{images[source, row, column]:.9g} dB"),
+                )
+            )
+            # Locate the displayed cell; its analysis coordinates are in the readout.
+            center = self.image.mapToParent(QtCore.QPointF(column + 0.5, row + 0.5))
+            indicator.accept(revision)
+            indicator.finish(revision, center.x(), fields, center.y())
 
     def largest(self):
         if self.result:
@@ -916,6 +1003,8 @@ class Window(QtWidgets.QMainWindow):
         self.retranslate()
 
     def retranslate(self):
+        for indicator in self.indicators.values():
+            indicator.retranslate()
         for widget, text, method in self.bindings:
             getattr(widget, method)(self.tr(text))
         for i, text in enumerate(("Waveform", "Spectrum", "Spectrogram")):
@@ -952,6 +1041,8 @@ class Window(QtWidgets.QMainWindow):
             if dark
             else ("#f4f6fa", "#ffffff", "#1e293b", "#d1dbe8")
         )
+        for indicator in self.indicators.values():
+            indicator.apply_theme(dark)
         self.setStyleSheet(f"""
             QMainWindow, QWidget {{ background: {bg}; color: {fg}; font-size: 12px; }}
             QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QPlainTextEdit, QTableWidget {{
@@ -994,6 +1085,7 @@ class Window(QtWidgets.QMainWindow):
         event.acceptProposedAction()
 
     def closeEvent(self, event):
+        self.reset_indicators()
         self.player.stop()
         if self.jobs.jobs:
             self.closing = True
@@ -1005,6 +1097,8 @@ class Window(QtWidgets.QMainWindow):
         self.settings.setValue("theme", self.theme_combo.currentData())
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("splitter", self.splitter.saveState())
+        for name, indicator in self.indicators.items():
+            self.settings.setValue(f"indicators/{name}", indicator.toggle.isChecked())
         for i, path in enumerate(self.paths):
             self.settings.setValue(f"path{i}", path.text())
         try:

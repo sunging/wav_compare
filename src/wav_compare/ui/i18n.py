@@ -1,6 +1,20 @@
 """Small explicit UI catalogue; analysis reports use stable English field names."""
 
 ZH = {
+    "Show indicator": "显示指示器",
+    "Pinned": "已固定",
+    "Hover for values; click to pin or unpin. Drag to pan.": "悬停查看数值；单击固定或解除固定；拖动平移。",
+    "Time": "时间",
+    "Time range": "时间范围",
+    "Sample index (0-based)": "采样点序号（从 0 开始）",
+    "Segment index (0-based)": "原始分段序号（从 0 开始）",
+    "Sample count": "样本数",
+    "Max absolute difference": "最大绝对差",
+    "Absolute difference": "绝对差值",
+    "MAE": "平均绝对差",
+    "Frequency": "频率",
+    "Source": "音源",
+    "Frame time": "分析帧时间",
     "Domain": "比较域",
     "Resampled B": "B 已重采样",
     "Alignment": "对齐状态",

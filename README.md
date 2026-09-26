@@ -26,6 +26,7 @@ Windows, macOS and Linux are covered by CI. Linux needs a graphical session and 
 
 - Open or drop two files or folders. Recursive folder matching uses case-insensitive relative paths and reports missing files and collisions.
 - Inspect A/B waveforms, B − A differences, segment statistics, Welch spectra and STFT spectrograms.
+- Each plot has an independent **Show indicator** toggle, enabled by default and saved locally. Hover for values; click to pin or unpin, and select the readout text to copy it. Pins are independent of other plots and playback. Segment readings use original segment statistics; spectra show PSD in dB/Hz, and spectrograms show the analyzed frame's actual amplitude in dB without color-range clipping. Sample and segment indexes are zero-based.
 - Drag inside waveform plots to pan, or drag an axis to pan that axis only. Drag selection edges to resize the selection. Panning is bounded by the audio duration and current channel's global amplitude range with a small margin; Reset zoom restores the full view.
 - Spectrum and spectrogram frequencies stay within 0–Nyquist. Spectrum power is bounded by the analyzed values with a margin; spectrogram time stays within the analyzed selection. Reset zoom also restores these plots.
 - Default preprocessing resamples **B to A's rate**, then estimates one fixed delay. Every transformation is reported. Strict mode disables both.
