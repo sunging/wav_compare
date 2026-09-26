@@ -12,11 +12,11 @@ A desktop workbench and headless CLI for comparing WAV audio, from **8 kHz** spe
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then:
 
 ```sh
-uv tool install --python 3.12 git+https://github.com/sunging/wav_compare.git
+uv tool install --python 3.14 git+https://github.com/sunging/wav_compare.git
 wav-compare
 ```
 
-Python 3.11 or newer is required. uv can download Python automatically. If the command is not on your PATH, run `uv tool update-shell` and reopen your terminal. The first formal release is **0.1.0**, prepared in an open release PR. Until that PR is merged, main reports the unreleased bootstrap version **0.0.0**.
+Python 3.11 or newer is required; the development environment defaults to Python 3.14. uv can download Python automatically. If the command is not on your PATH, run `uv tool update-shell` and reopen your terminal. The first formal release is **0.1.0**, prepared in an open release PR. Until that PR is merged, main reports the unreleased bootstrap version **0.0.0**.
 
 After a version has actually been released, append its tag to the Git URL, e.g. `git+https://github.com/sunging/wav_compare.git@v0.1.0`. No PyPI publication or standalone installer is required.
 

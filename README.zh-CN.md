@@ -11,11 +11,11 @@
 安装 [uv](https://docs.astral.sh/uv/getting-started/installation/) 后执行：
 
 ```sh
-uv tool install --python 3.12 git+https://github.com/sunging/wav_compare.git
+uv tool install --python 3.14 git+https://github.com/sunging/wav_compare.git
 wav-compare
 ```
 
-支持 Python 3.11 及以上，开发环境固定为 3.12。找不到命令时执行 `uv tool update-shell` 并重新打开终端。无需 PyPI 即可安装。
+支持 Python 3.11 及以上，开发环境固定为 3.14。找不到命令时执行 `uv tool update-shell` 并重新打开终端。无需 PyPI 即可安装。
 
 首个正式版本 `0.1.0` 通过发布 PR 准备，合并之前 main 的包版本为未发布的 `0.0.0`。正式发布后才可在 Git URL 后添加 `@v0.1.0` 安装固定版本。
 
