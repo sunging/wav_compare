@@ -22,6 +22,7 @@ from .indicator import PlotIndicator
 from .jobs import Jobs
 from .player import Player
 from .preferences import Preferences, PreferencesDialog
+from .selection import FORMATS, MODES, SelectionEditor
 from .timeline import PlaybackTimeline
 
 COLORS = ("#52b9f5", "#ffb454", "#74dbb0")
@@ -201,7 +202,9 @@ class Window(QtWidgets.QMainWindow):
 
     def panel_header(self, layout, index):
         header = QtWidgets.QHBoxLayout()
-        header.addWidget(self.label(("Files & results", "Parameters")[index]))
+        title = self.label(("Files & results", "Parameters")[index])
+        title.setWordWrap(True)
+        header.addWidget(title)
         header.addStretch()
         button = QtWidgets.QToolButton()
         button.setText("‹" if index == 0 else "›")
@@ -351,28 +354,8 @@ class Window(QtWidgets.QMainWindow):
             plot.setMouseEnabled(x=True, y=True)
             plot.getViewBox().setMouseMode(pg.ViewBox.PanMode)
         self.tabs.addTab(self.add_indicator("spectrogram", self.spectrogram_plot), "Spectrogram")
-        selection = QtWidgets.QHBoxLayout()
-        self.begin, self.end = QtWidgets.QDoubleSpinBox(), QtWidgets.QDoubleSpinBox()
-        for text, control in (("Start (s)", self.begin), ("End (s)", self.end)):
-            control.setRange(0, 10**8)
-            control.setDecimals(6)
-            control.setFixedWidth(140)
-            self.bind(control, text, "setAccessibleName")
-            self.bind(control, text, "setToolTip")
-            selection.addWidget(self.label(text))
-            selection.addWidget(control)
-        selection_menu = QtWidgets.QMenu(self)
-        selection_menu.addActions(self.selection_actions)
-        selection_button = QtWidgets.QToolButton()
-        selection_button.setIcon(
-            self.style().standardIcon(QtWidgets.QStyle.SP_FileDialogDetailedView)
-        )
-        self.bind(selection_button, "Selection", "setToolTip")
-        self.bind(selection_button, "Selection", "setAccessibleName")
-        selection_button.setMenu(selection_menu)
-        selection_button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
-        selection.addWidget(selection_button)
-        ml.addLayout(selection)
+        self.selection_editor = SelectionEditor(self.tr, self.selection_actions)
+        ml.addWidget(self.selection_editor)
         self.splitter.addWidget(middle)
         right = QtWidgets.QWidget()
         rl = QtWidgets.QVBoxLayout(right)
@@ -454,12 +437,18 @@ class Window(QtWidgets.QMainWindow):
         self.button("Pause / resume", self.pause_playback, playback)
         self.button("Stop", self.player.stop, playback)
         playback.addWidget(self.loop)
-        playback.addWidget(self.label("Volume"))
+        volume_group = QtWidgets.QWidget()
+        volume_group.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Preferred)
+        volume_layout = QtWidgets.QHBoxLayout(volume_group)
+        volume_layout.setContentsMargins(0, 0, 0, 0)
+        volume_layout.setSpacing(6)
+        volume_layout.addWidget(self.label("Volume"))
         self.volume = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.volume.setRange(0, 100)
         self.volume.setValue(50)
         self.volume.setMaximumWidth(100)
-        playback.addWidget(self.volume)
+        volume_layout.addWidget(self.volume)
+        playback.addWidget(volume_group)
         layout.addLayout(playback)
         timeline_row = QtWidgets.QHBoxLayout()
         self.seek = PlaybackTimeline()
@@ -550,6 +539,10 @@ class Window(QtWidgets.QMainWindow):
         self.source.setCurrentIndex(prefs.number("playback/source", 0, 0, 2))
         self.loop.setChecked(prefs.boolean("playback/loop", False))
         self.original.setChecked(prefs.boolean("playback/original", False))
+        self.selection_editor.set_preferences(
+            prefs.choice("selection/format", tuple(FORMATS), "seconds"),
+            prefs.choice("selection/mode", tuple(MODES), "start_end"),
+        )
         geometry = self.settings.value("geometry")
         split = self.settings.value("splitter")
         if isinstance(geometry, QtCore.QByteArray):
@@ -594,8 +587,9 @@ class Window(QtWidgets.QMainWindow):
         self.wave_plot.sigXRangeChanged.connect(lambda: self.redraw_timer.start())
         self.region.sigRegionChanged.connect(self.region_changed)
         self.region.sigRegionChangeFinished.connect(self.selection_committed)
-        self.begin.valueChanged.connect(self.spin_region)
-        self.end.valueChanged.connect(self.spin_region)
+        self.selection_editor.selectionEdited.connect(self.selection_committed)
+        self.selection_editor.preferencesChanged.connect(self.schedule_save)
+        self.selection_editor.message.connect(self.message)
         self.tabs.currentChanged.connect(self.update_spectrum)
         self.source.currentIndexChanged.connect(self.update_spectrum)
         self.volume.valueChanged.connect(lambda n: self.player.set_volume(n / 100))
@@ -705,6 +699,8 @@ class Window(QtWidgets.QMainWindow):
             "playback/source": self.source.currentIndex(),
             "playback/loop": self.loop.isChecked(),
             "playback/original": self.original.isChecked(),
+            "selection/format": self.selection_editor.value_format,
+            "selection/mode": self.selection_editor.mode,
         }
         for i, action in enumerate(self.panel_actions):
             values[f"layout/visible{i}"] = action.isChecked()
@@ -1068,9 +1064,7 @@ class Window(QtWidgets.QMainWindow):
         self.channel.blockSignals(False)
         duration = result.frames / result.rate
         self.seek.set_duration(duration, result.rate)
-        for control in (self.begin, self.end):
-            with QtCore.QSignalBlocker(control):
-                control.setMaximum(duration)
+        self.selection_editor.set_context(result.rate, result.frames)
         self.region.setBounds((0, result.frames / result.rate))
         self.region.setRegion((0, min(10.0, result.frames / result.rate)))
         self.region_changed()
@@ -1185,43 +1179,28 @@ class Window(QtWidgets.QMainWindow):
         self.diff_curve.setData(times, difference)
 
     def region_changed(self):
-        lo, hi = self.region.getRegion()
-        if self.result:
-            self.seek.set_selection(lo, hi)
-            lo, hi = self.seek.selection
-            if (lo, hi) != self.region.getRegion():
-                with QtCore.QSignalBlocker(self.region):
-                    self.region.setRegion((lo, hi))
-        for control, value in ((self.begin, lo), (self.end, hi)):
-            blocker = QtCore.QSignalBlocker(control)
-            control.setValue(value)
-            del blocker
-        self.update_seek_bounds()
-
-    def spin_region(self):
         if not self.result:
             return
-        lo, hi = self.begin.value(), self.end.value()
-        step = self.seek.step
-        if self.sender() is self.begin:
-            lo = min(lo, hi - step)
-        else:
-            hi = max(hi, lo + step)
-        self.selection_preview(lo, hi)
-        self.selection_committed()
+        self.selection_preview(*self.region.getRegion())
 
     def selection_preview(self, lo, hi):
         if not self.result:
             return
+        rate = self.result.rate
+        self.selection_editor.set_selection(round(lo * rate), round(hi * rate))
+        self.sync_selection()
+
+    def sync_selection(self):
+        lo, hi = self.selection_editor.seconds
         self.seek.set_selection(lo, hi)
         with QtCore.QSignalBlocker(self.region):
-            self.region.setRegion(self.seek.selection)
-        self.region_changed()
+            self.region.setRegion((lo, hi))
+        self.update_seek_bounds()
 
     def selection_committed(self, *_):
         if not self.result:
             return
-        self.region_changed()
+        self.sync_selection()
         self.update_seek_bounds()
         if self.loop.isChecked():
             lo, hi = self.seek.seek_bounds
@@ -1239,8 +1218,11 @@ class Window(QtWidgets.QMainWindow):
             return
         result = self.result
         # Convert display-relative selection to the full aligned timeline.
-        origin = result.options.region[0] if result.options.region else 0
-        region = (origin + self.begin.value(), origin + self.end.value()) if selected else None
+        origin = round(result.options.region[0] * result.rate) if result.options.region else 0
+        start, end = self.selection_editor.bounds
+        region = (
+            ((origin + start) / result.rate, (origin + end) / result.rate) if selected else None
+        )
         options = replace(result.options, region=region)
         a, b = result.report["a"]["path"], result.report["b"]["path"]
         self.jobs.cancel_all()
@@ -1257,7 +1239,8 @@ class Window(QtWidgets.QMainWindow):
         if not self.result or self.tabs.currentIndex() == 0:
             return
         result = self.result
-        begin, end, ch = self.begin.value(), self.end.value(), max(0, self.channel.currentIndex())
+        begin, end = self.selection_editor.seconds
+        ch = max(0, self.channel.currentIndex())
         fft, hop = int(self.fft.currentText()), self.hop.value()
         bounds = (
             max(0, round(begin * result.rate)) / result.rate,
@@ -1441,6 +1424,7 @@ class Window(QtWidgets.QMainWindow):
         self.jobs.submit("navigate", find)
 
     def reset_playback(self):
+        self.selection_editor.set_context(1, 0)
         self.seek.set_duration(0, 1)
         self.playback_position = 0.0
         self.time_label.setText("00:00.000 / 00:00.000")
@@ -1454,7 +1438,7 @@ class Window(QtWidgets.QMainWindow):
         if self.original.isChecked() and self.source.currentIndex() in (0, 1):
             info = self.result.report["a" if self.source.currentIndex() == 0 else "b"]
             duration = min(duration, info["frames"] / info["samplerate"])
-        lo, hi = self.seek.selection if self.loop.isChecked() else (0.0, duration)
+        lo, hi = self.selection_editor.seconds if self.loop.isChecked() else (0.0, duration)
         return lo, min(hi, duration)
 
     def update_seek_bounds(self):
@@ -1574,6 +1558,7 @@ class Window(QtWidgets.QMainWindow):
         self.retranslate()
 
     def retranslate(self):
+        self.selection_editor.retranslate()
         self.seek.select_all_text = self.tr("Select all")
         for indicator in self.indicators.values():
             indicator.retranslate()
@@ -1618,7 +1603,7 @@ class Window(QtWidgets.QMainWindow):
         self.seek.apply_theme(dark)
         self.setStyleSheet(f"""
             QMainWindow, QWidget {{ background: {bg}; color: {fg}; font-size: 12px; }}
-            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QPlainTextEdit, QTableWidget {{
+            QLineEdit, QAbstractSpinBox, QComboBox, QPlainTextEdit, QTableWidget {{
                 background: {panel}; border: 1px solid {border}; border-radius: 4px; padding: 5px; }}
             QPushButton, QToolButton {{ background: {panel}; border: 1px solid {border}; border-radius: 4px; padding: 4px 7px; }}
             QPushButton:hover, QToolButton:hover {{ border-color: #4298d8; }}

@@ -11,6 +11,7 @@ from PySide6 import QtCore, QtMultimedia, QtWidgets
 from wav_compare.engine import compare
 from wav_compare.models import Options
 from wav_compare.ui.app import Window
+from wav_compare.ui.selection import FORMATS, MODES
 
 
 def main():
@@ -23,6 +24,8 @@ def main():
     parser.add_argument("--language", choices=("zh", "en"), default="zh")
     parser.add_argument("--theme", choices=("light", "dark"), default="dark")
     parser.add_argument("--collapse-panels", action="store_true")
+    parser.add_argument("--selection-format", choices=FORMATS, default="seconds")
+    parser.add_argument("--selection-mode", choices=MODES, default="start_end")
     args = parser.parse_args()
     root = Path(".artifacts/demo")
     root.mkdir(parents=True, exist_ok=True)
@@ -46,6 +49,7 @@ def main():
         window.strict.setChecked(True)
     result = compare(root / "reference.wav", root / "candidate.wav", Options(strict=True))
     window.set_result(result)
+    window.selection_editor.set_preferences(args.selection_format, args.selection_mode)
     window.rows = [
         {
             "name": "demo / reference ↔ candidate",
@@ -83,6 +87,8 @@ def main():
                         window.minimumSizeHint().height(),
                     ],
                     "plot_size": [window.tabs.width(), window.tabs.height()],
+                    "selection_wrapped": window.selection_editor.wrapped,
+                    "selection_samples": window.selection_editor.bounds,
                 },
                 ensure_ascii=False,
             ),

@@ -74,7 +74,7 @@ def test_plot_drag_and_limits(qtbot, audio, tmp_path, plot_name):
         drag(qtbot, plot, start, end)
         assert not window.indicators["wave"].fixed
         assert window.region.getRegion()[0] > 0.6
-        assert window.begin.value() == pytest.approx(window.region.getRegion()[0], abs=1e-6)
+        assert window.selection_editor.seconds[0] == window.region.getRegion()[0]
     window.jobs.cancel_all()
     qtbot.waitUntil(lambda: not window.jobs.jobs, timeout=5000)
     window.close()

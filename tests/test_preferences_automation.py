@@ -464,8 +464,8 @@ def test_compact_layout_fits_window(window, qtbot, language, size):
     qtbot.wait(50)
     assert window.width() == size[0] and window.height() == size[1]
     assert window.centralWidget().minimumSizeHint().width() <= size[0]
-    assert window.begin.width() == 140
-    assert window.end.width() == 140
+    for field in window.selection_editor.fields:
+        assert field.width() >= field.minimumSizeHint().width()
     assert window.tabs.width() > 350 and window.tabs.height() > 400
     for edit in window.paths:
         assert edit.width() >= 80

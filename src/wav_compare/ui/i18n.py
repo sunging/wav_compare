@@ -1,6 +1,21 @@
 """Small explicit UI catalogue; analysis reports use stable English field names."""
 
 ZH = {
+    "Seconds": "秒",
+    "hh:mm:ss": "时:分:秒",
+    "Samples": "采样",
+    "Start / end": "起点／终点",
+    "Start / length": "起点／长度",
+    "Length / end": "长度／终点",
+    "Center / length": "中心／长度",
+    "Start": "起点",
+    "End": "终点",
+    "Length": "长度",
+    "Center": "中心",
+    "Selection format": "选区数值格式",
+    "Selection type": "选区选择类型",
+    "Invalid selection value; restored.": "选区数值无效，已恢复上次有效值。",
+    "Positions use the current analysis sample rate. End is exclusive. Commit with Enter; arrows step one sample. Centers may use half samples.": "位置按当前分析采样率计数，终点不包含在选区内。回车确认，步进按钮每次调整一个采样；中心可使用半采样位置。",
     "File": "文件",
     "View": "视图",
     "Settings": "设置",

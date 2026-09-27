@@ -124,14 +124,16 @@ def test_drag_selection_sync_and_no_analysis(window, qtbot, monkeypatch, start, 
     drag(qtbot, bar, point(bar, start), point(bar, end))
     assert bar.selection == pytest.approx((0.4, 1.5), abs=0.01)
     assert window.region.getRegion() == bar.selection
-    assert (window.begin.value(), window.end.value()) == pytest.approx(bar.selection, abs=1e-6)
+    assert window.selection_editor.seconds == bar.selection
     assert window.player.state == "stopped"
     assert calls == []
     window.region.setRegion((0.6, 1.7))
     assert bar.selection == pytest.approx((0.6, 1.7))
-    window.begin.setValue(0.8)
+    window.selection_editor.fields[0].lineEdit().setText("0.8")
+    window.selection_editor.fields[0].commit()
     assert bar.selection == pytest.approx((0.8, 1.7))
-    window.end.setValue(0.1)
+    window.selection_editor.fields[1].lineEdit().setText("0.1")
+    window.selection_editor.fields[1].commit()
     assert bar.selection[1] - bar.selection[0] == pytest.approx(1 / 8000)
 
 
@@ -221,6 +223,30 @@ def test_loop_bounds_and_live_selection_changes(window, qtbot):
     assert window.player.state == "paused"
     window.play()
     assert window.player.origin == 0
+
+
+def test_selection_formats_keep_paused_loop_and_sample_edit_updates_bounds(window, qtbot):
+    from wav_compare.ui.selection import FORMATS, MODES
+
+    window.selection_preview(0.5, 1.5)
+    window.loop.setChecked(True)
+    window.play()
+    window.player.pause()
+    producer, origin = window.player.producer, window.player.origin
+    for mode in MODES:
+        for value_format in FORMATS:
+            window.selection_editor.set_preferences(value_format, mode)
+            assert window.player.producer is producer
+            assert window.player.state == "paused"
+            assert window.player.origin == origin
+    window.selection_editor.set_preferences("samples", "start_length")
+    field = window.selection_editor.fields[0]
+    field.lineEdit().setText("8000")
+    field.commit()
+    assert window.selection_editor.bounds == (8000, 16000)
+    assert window.player.state == "paused"
+    assert window.player.origin == 1 and window.player.end == 2
+    assert window.player.producer is not producer
 
 
 def test_keyboard_and_position_callback_during_drag(window, qtbot):

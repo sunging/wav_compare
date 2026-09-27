@@ -12,6 +12,7 @@ class PlaybackTimeline(QtWidgets.QWidget):
         super().__init__(parent)
         self.duration = 0.0
         self.step = 1.0
+        self.rate, self.frames = 1, 0
         self.position = 0.0
         self.selection = (0.0, 0.0)
         self.seek_bounds = (0.0, 0.0)
@@ -27,8 +28,10 @@ class PlaybackTimeline(QtWidgets.QWidget):
         self.setEnabled(False)
 
     def set_duration(self, duration, rate):
-        self.duration = max(0.0, duration)
-        self.step = min(1 / rate, self.duration) if self.duration else 0.0
+        self.rate = max(1, int(rate))
+        self.frames = max(0, round(duration * self.rate))
+        self.duration = self.frames / self.rate
+        self.step = 1 / self.rate if self.frames else 0.0
         self.position = 0.0
         self.selection = (0.0, self.duration)
         self.seek_bounds = (0.0, self.duration)
@@ -41,10 +44,13 @@ class PlaybackTimeline(QtWidgets.QWidget):
         self.update()
 
     def set_selection(self, lo, hi):
-        lo, hi = sorted((lo, hi))
-        lo = max(0.0, min(lo, self.duration - self.step))
-        hi = max(lo + self.step, min(hi, self.duration))
-        self.selection = (lo, hi)
+        if self.frames:
+            lo, hi = sorted((round(lo * self.rate), round(hi * self.rate)))
+            lo = max(0, min(lo, self.frames - 1))
+            hi = max(lo + 1, min(hi, self.frames))
+            self.selection = (lo / self.rate, hi / self.rate)
+        else:
+            self.selection = (0.0, 0.0)
         self.update()
 
     def x_at(self, seconds):
