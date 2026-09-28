@@ -45,6 +45,19 @@ class SegmentStore:
         finally:
             data._mmap.close()
 
+    def blocks(self, start, stop, channel, size=65536, reverse=False):
+        """Yield (first, rows) slices of one channel, opening the file once per scan."""
+        start, stop = max(0, start), min(len(self), stop)
+        if stop <= start:
+            return
+        data = np.load(self.owner.segments_path, mmap_mode="r")
+        try:
+            firsts = range(start, stop, size)
+            for first in reversed(firsts) if reverse else firsts:
+                yield first, np.array(data[first : min(first + size, stop), channel])
+        finally:
+            data._mmap.close()
+
 
 @dataclass
 class Comparison:
@@ -105,7 +118,8 @@ def compare(
         ca, cb = [p[0] for p in options.pairs], [p[1] for p in options.pairs]
     else:
         ca = cb = list(range(1 if options.mix else min(a_info.channels, b_info.channels)))
-    temporary = tempfile.TemporaryDirectory(prefix="wav-compare-")
+    # A late mmap release on Windows must not turn result disposal into an error.
+    temporary = tempfile.TemporaryDirectory(prefix="wav-compare-", ignore_cleanup_errors=True)
     directory = Path(temporary.name)
     try:
         rate = a_info.samplerate

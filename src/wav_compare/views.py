@@ -95,7 +95,10 @@ def waveform(result: Comparison, begin: float, end: float, channel: int, pixels:
     width, path, size = chosen
     lo, hi = start // width, min(size, (stop + width - 1) // width)
     array = np.load(path, mmap_mode="r")
-    data = np.array(array[lo:hi, channel])
+    try:
+        data = np.array(array[lo:hi, channel])
+    finally:
+        array._mmap.close()
     # Also cap the finest level when the viewport falls between raw and envelope.
     stride = max(1, int(np.ceil(len(data) / pixels)))
     if stride > 1:
@@ -104,9 +107,11 @@ def waveform(result: Comparison, begin: float, end: float, channel: int, pixels:
             [np.minimum.reduceat(data[..., 0], edges), np.maximum.reduceat(data[..., 1], edges)],
             axis=-1,
         )
+    # Place each (possibly aggregated) envelope at the center of the samples it covers.
     times = (
         np.minimum(
-            np.arange(len(data)) * width * stride + lo * width + width / 2, result.frames - 1
+            np.arange(len(data)) * width * stride + lo * width + width * stride / 2,
+            result.frames - 1,
         )
         / result.rate
     )

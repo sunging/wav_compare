@@ -41,9 +41,13 @@ def parser():
 def channel_pairs(text: str):
     if not text.strip():
         return ()
-    pairs = tuple(tuple(int(v) - 1 for v in item.split(":")) for item in text.split(","))
+    message = "Use 1-based channel pairs, e.g. 1:1,2:2"
+    try:
+        pairs = tuple(tuple(int(v) - 1 for v in item.split(":")) for item in text.split(","))
+    except ValueError:
+        raise ValueError(message) from None
     if any(len(p) != 2 or min(p) < 0 for p in pairs):
-        raise ValueError("Use 1-based channel pairs, e.g. 1:1,2:2")
+        raise ValueError(message)
     return pairs
 
 

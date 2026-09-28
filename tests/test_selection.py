@@ -72,15 +72,28 @@ def test_invalid_values(text, value_format, center):
         ("center_length", 0, 0, (0, 20)),
         ("center_length", 0, 100, (80, 100)),
         ("center_length", 1, 100, (0, 60)),
-        ("center_length", 1, 19, (20, 39)),
+        ("center_length", 1, 19, (21, 40)),
         ("center_length", 1, 21, (20, 41)),
-        ("center_length", 0, "30.5", (20, 40)),
+        ("center_length", 0, "30.5", (21, 41)),
     ],
 )
 def test_edit_constraints(mode, index, value, expected):
     state = SampleSelection(8000, 100, 20, 40)
     state.edit(mode, index, Decimal(value))
     assert state.bounds == expected
+
+
+@pytest.mark.parametrize("length", [19, 20])
+def test_center_edits_are_monotonic_with_consistent_half_sample_shift(length):
+    state = SampleSelection(8000, 1000, 100, 100 + length)
+    centers = []
+    for center in range(200, 206):
+        state.edit("center_length", 0, Decimal(center))
+        assert state.end - state.start == length
+        centers.append(Decimal(state.start + state.end) / 2)
+    # Each integer center step moves the selection by exactly one sample.
+    assert all(b - a == 1 for a, b in zip(centers, centers[1:], strict=False))
+    assert centers[0] == (200 if length % 2 == 0 else Decimal("200.5"))
 
 
 @pytest.mark.parametrize("mode", MODES)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, localcontext
@@ -87,7 +88,9 @@ class SampleSelection:
             else:
                 center = Decimal(start + end) / 2
                 length = clamp(number, 1, min(start + end, 2 * self.frames - start - end))
-            start = clamp(round(center - Decimal(length) / 2), 0, self.frames - length)
+            # Round half up (not half-even) so odd lengths always shift the center by +0.5.
+            start = math.floor(center - Decimal(length) / 2 + Decimal("0.5"))
+            start = clamp(start, 0, self.frames - length)
             end = start + length
         self.start, self.end = start, end
 
