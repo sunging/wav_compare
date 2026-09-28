@@ -42,7 +42,9 @@ class Readout(QtWidgets.QLabel):
         # Pending reads clear the text briefly; keep the plot still while hovering.
         minimum = self.height() if width == getattr(self, "last_width", None) else 34
         self.last_width = width
-        self.setFixedHeight(max(34, minimum, bounds.height() + 2))
+        # QLabel's own wrapped layout can exceed plain font metrics (e.g. CJK fallback fonts).
+        wrapped = super().heightForWidth(self.width()) if self.text() else 0
+        self.setFixedHeight(max(34, minimum, bounds.height() + 2, wrapped))
 
 
 class PlotIndicator(QtCore.QObject):

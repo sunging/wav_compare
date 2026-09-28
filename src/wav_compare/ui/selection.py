@@ -347,6 +347,10 @@ class SelectionEditor(QtWidgets.QWidget):
             )
             self.grid.setColumnStretch(1, 1 if wrapped else 0)
             self.grid.setColumnStretch(2, 0 if wrapped else 1)
+        # Field hints change with format/language; recompute cells now instead of relying on
+        # a posted layout request, which can leave a stale, clipped column in place.
+        self.grid.invalidate()
+        self.grid.activate()
         self.updateGeometry()
 
     def minimumSizeHint(self):
