@@ -1,4 +1,10 @@
 .venv/
+# Local IDE/editor settings
+.idea/
+.vscode/
+.vs/
+*.iml
+
 __pycache__/
 *.py[cod]
 .pytest_cache/

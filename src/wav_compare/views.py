@@ -38,6 +38,43 @@ class ByteCache:
         self.size = 0
 
 
+def amplitude_ranges(result: Comparison, channel: int):
+    """Global plot bounds from at most 1024 envelope bins, independent of zoom."""
+    if result.peaks:
+        peaks = np.load(result.peaks[-1][1], mmap_mode="r")
+        try:
+            low = peaks[:, channel, :, 0].min(axis=0)
+            high = peaks[:, channel, :, 1].max(axis=0)
+        finally:
+            peaks._mmap.close()
+    else:
+        raise ValueError("Waveform details are required for plot bounds")
+    maximum = max(abs(low[2]), abs(high[2]))
+    return (
+        (min(0.0, *low[:2]), max(0.0, *high[:2])),
+        (min(0.0, low[2]), max(0.0, high[2])),
+        (0.0, maximum),
+    )
+
+
+def difference_overview(result: Comparison, channel: int):
+    """Normalized |B − A| envelope over the whole result from the coarsest level (<=1024 bins).
+
+    Returns (bin_width_samples, values in 0..1); an all-zero difference gives zeros.
+    """
+    if not result.peaks:
+        return 1, np.zeros(0)
+    width, path, _ = result.peaks[-1]
+    peaks = np.load(path, mmap_mode="r")
+    try:
+        difference = np.array(peaks[:, channel, 2])
+    finally:
+        peaks._mmap.close()
+    values = np.abs(difference).max(axis=1)
+    maximum = float(values.max(initial=0.0))
+    return width, values / maximum if maximum > 0 else np.zeros_like(values)
+
+
 def waveform(result: Comparison, begin: float, end: float, channel: int, pixels: int):
     start = max(0, min(result.frames - 1, int(begin * result.rate)))
     stop = min(result.frames, max(start + 1, int(end * result.rate)))
@@ -76,7 +113,10 @@ def waveform(result: Comparison, begin: float, end: float, channel: int, pixels:
     width, path, size = chosen
     lo, hi = start // width, min(size, (stop + width - 1) // width)
     array = np.load(path, mmap_mode="r")
-    data = np.array(array[lo:hi, channel])
+    try:
+        data = np.array(array[lo:hi, channel])
+    finally:
+        array._mmap.close()
     # Also cap the finest level when the viewport falls between raw and envelope.
     stride = max(1, int(np.ceil(len(data) / pixels)))
     if stride > 1:
@@ -85,9 +125,11 @@ def waveform(result: Comparison, begin: float, end: float, channel: int, pixels:
             [np.minimum.reduceat(data[..., 0], edges), np.maximum.reduceat(data[..., 1], edges)],
             axis=-1,
         )
+    # Place each (possibly aggregated) envelope at the center of the samples it covers.
     times = (
         np.minimum(
-            np.arange(len(data)) * width * stride + lo * width + width / 2, result.frames - 1
+            np.arange(len(data)) * width * stride + lo * width + width * stride / 2,
+            result.frames - 1,
         )
         / result.rate
     )

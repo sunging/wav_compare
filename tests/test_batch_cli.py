@@ -3,8 +3,10 @@ import subprocess
 import sys
 
 import numpy as np
+import pytest
 
 from wav_compare.batch import discover, run_batch
+from wav_compare.cli import channel_pairs
 from wav_compare.models import Cancellation, Options
 
 
@@ -48,3 +50,10 @@ def test_headless_cli(audio, tmp_path):
     assert json.loads(report.read_text())["results"][0]["status"] == "different"
     script = "from wav_compare.cli import parser; import sys; parser(); assert 'PySide6' not in sys.modules"
     subprocess.run([sys.executable, "-c", script], check=True)
+
+
+def test_channel_pairs_report_a_friendly_error():
+    assert channel_pairs(" 1:2, 2:1 ") == ((0, 1), (1, 0))
+    for text in ("1:1,", "a:1", "1", "0:1", "1:2:3"):
+        with pytest.raises(ValueError, match="1-based channel pairs"):
+            channel_pairs(text)

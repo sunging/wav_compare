@@ -12,11 +12,11 @@ A desktop workbench and headless CLI for comparing WAV audio, from **8 kHz** spe
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then:
 
 ```sh
-uv tool install --python 3.12 git+https://github.com/sunging/wav_compare.git
+uv tool install --python 3.14 git+https://github.com/sunging/wav_compare.git
 wav-compare
 ```
 
-Python 3.11 or newer is required. uv can download Python automatically. If the command is not on your PATH, run `uv tool update-shell` and reopen your terminal. The first formal release is **0.1.0**, prepared in an open release PR. Until that PR is merged, main reports the unreleased bootstrap version **0.0.0**.
+Python 3.11 or newer is required; the development environment defaults to Python 3.14. uv can download Python automatically. If the command is not on your PATH, run `uv tool update-shell` and reopen your terminal. The first formal release is **0.1.0**, prepared in an open release PR. Until that PR is merged, main reports the unreleased bootstrap version **0.0.0**.
 
 After a version has actually been released, append its tag to the Git URL, e.g. `git+https://github.com/sunging/wav_compare.git@v0.1.0`. No PyPI publication or standalone installer is required.
 
@@ -24,15 +24,26 @@ Windows, macOS and Linux are covered by CI. Linux needs a graphical session and 
 
 ## Workbench
 
-- Open or drop two files or folders. Recursive folder matching uses case-insensitive relative paths and reports missing files and collisions.
+- Open or drop two files or folders to compare automatically. Path and analysis-option changes are debounced for 400 ms; only the latest inputs are analyzed. Recursive folder matching uses case-insensitive relative paths and reports missing files and collisions. Batch rows appear as each file finishes; the first analyzable result (or the previously selected relative path) opens without waiting for the whole batch. The results table shows color-coded status, maximum difference, lag, RMSE and SNR, and sorts numeric columns by value. Dropping one file onto the A or B field replaces only that side; dropping elsewhere fills A/B from two paths, or the empty side from one.
+- Collapse **Files & results** and **Parameters and metrics** independently using their header arrows, the persistent top toggles or the **View** menu. Plots expand into the freed space; reopening a panel restores its width. **View → Reset layout** restores the default layout without changing analysis options.
 - Inspect A/B waveforms, B − A differences, segment statistics, Welch spectra and STFT spectrograms.
-- Default preprocessing resamples **B to A's rate**, then estimates one fixed delay. Every transformation is reported. Strict mode disables both.
+- Each plot has an independent **Show indicator** toggle, enabled by default and saved locally. Hover for values; click to pin or unpin, and select the readout text to copy it. Pins are independent of other plots and playback. Segment readings use original segment statistics; spectra show PSD in dB/Hz, and spectrograms show the analyzed frame's actual amplitude in dB without color-range clipping. Sample and segment indexes are zero-based.
+- Drag inside waveform plots to pan, or drag an axis to pan that axis only. Drag selection edges to resize the selection. Panning is bounded by the audio duration and current channel's global amplitude range with a small margin; Reset zoom restores the full view.
+- Spectrum and spectrogram frequencies stay within 0–Nyquist. Spectrum power is bounded by the analyzed values with a margin; spectrogram time stays within the analyzed selection. Reset zoom also restores these plots.
+- Default preprocessing resamples **B to A's rate**, then estimates one fixed delay. Every transformation is reported. Strict mode disables both. Parameters are grouped into alignment, comparison and display options; controls the current mode ignores are disabled (for example alignment in strict mode), and invalid or conflicting channel pairs are outlined in red with the reason in the tooltip.
+- **Results** is a grouped table (summary including alignment confidence or failure reason, channel metrics, excluded samples); its context menu copies the selected or all rows. Drag the divider between parameters and results to resize them.
 - Compare all channels by index, enter explicit **1-based** pairs (`1:1,2:2`), or deliberately mix each input to mono.
-- Select a region, find the largest difference, step through differing regions, and listen to A, B or their difference. Playback volume never changes metrics.
-- Switch English/Chinese and system/light/dark themes. Paths, options and layout are saved locally.
+- Select a region, find the largest difference, step through differing regions, and listen to A, B or their difference. Playback volume never changes metrics. Difference navigation uses its own red marker and continues from the last found difference, independent of playback; when stopped and not looping, the playback position follows it so Play starts there. A heat strip on the playback timeline shows where differences occur.
+- FFT/hop changes update only the spectrum, with computation deferred until a spectral tab is visible. Switching between spectral tabs or playback sources reuses the analysis. Selection edits do not rerun analysis: use the **Selection** menu below the plots or the **Analysis** menu to analyze the selection, compare the full files or refresh the spectrum.
+- The compact selection editor supports **seconds**, **hh:mm:ss** (including durations over 24 hours), and **samples**, with **start/end**, **start/length**, **length/end**, or **center/length** fields. Labels stay beside their inputs; narrow panes move the format/type selectors above the values. Format and type are saved locally, and switching them preserves the exact selection without restarting playback or computation.
+- Selection positions are zero-based boundaries in the current analysis result, using its sample rate after preprocessing. The end is exclusive; length is `end - start`. Input and dragging snap to sample boundaries, retaining at least one sample. Press Enter or leave a field to commit; arrows step one sample. Invalid text restores the last valid value. Moving an anchor keeps the length and stops at the audio boundary; changing length keeps the anchor and limits the length. Centers may use half samples; changing odd/even length can move the actual center by half a sample, which is shown in the editor. Nested selection analysis adds the current result's sample offset before comparing the original inputs.
+- **Settings → Preferences** offers English/Chinese, system/light/dark themes (system follows live OS changes), automatic comparison, startup comparison and path restoration. All three behavior switches default to enabled. Existing local QSettings are preserved and extended to remember panel visibility/widths, geometry, analysis options, FFT/hop and playback preferences. Results, playback position and temporary selections are not persisted. Disabling path restoration clears saved paths; explicit launch paths take precedence.
+- Manual comparison remains available. Cancel stops pending automatic comparison and current tasks without retrying until another input change or manual comparison. Disabling automatic comparison leaves running work alone. Exports live in **File**, and **Clear cache** in **Analysis**.
 - Export versioned JSON or CSV. Single-file export reflects the current selection analysis; directory export contains the complete batch.
 
-Keyboard: **Ctrl+Enter** compare, **Esc** cancel, **Ctrl+0** reset zoom, **Space** pause/resume. The seek bar restarts playback at a position inside the selection. Original-input playback uses each source's original seconds; processed playback follows the aligned timeline.
+The playback timeline supports click-to-seek, dragging in either direction to select, dragging selection edges to resize, and **Select all** in its context menu. Selection stays synchronized with the waveform and time inputs. Seeking preserves playing, paused or stopped state; Stop keeps the position. Without looping, playback continues to the audio end; with looping, it stays inside the selection. Seeking into a loop plays its remainder first, then repeats the entire selection. Playing again at the end restarts from the beginning. Changing the source stops playback. Original-input playback uses each source's original seconds and is limited to that file's end; processed playback follows the aligned timeline.
+
+Keyboard: **Ctrl+Enter** compare, **Esc** cancel, **Ctrl+0** reset zoom, **Space** play/pause/resume, **Ctrl+Q** exit. With the timeline focused, **Left/Right** seek by 0.1 seconds and **Home/End** seek to the effective playback bounds.
 
 ## Command line
 
