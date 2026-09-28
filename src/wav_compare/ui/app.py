@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import json
 import sys
 from collections import OrderedDict
+from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 
@@ -12,20 +12,38 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from .. import get_version
 from ..batch import discover, run_batch
-from ..cli import channel_pairs
 from ..engine import compare
-from ..models import Options
 from ..reports import export_csv, export_json
-from ..views import ByteCache, amplitude_ranges, spectra, waveform
+from ..views import ByteCache, amplitude_ranges, difference_overview, spectra, waveform
 from .i18n import translate
 from .indicator import PlotIndicator
 from .jobs import Jobs
+from .parameters import ParametersPanel
 from .player import Player
 from .preferences import Preferences, PreferencesDialog
+from .results import ANALYZABLE_EXCLUDED, MetricsView, ResultsTable
 from .selection import FORMATS, MODES, SelectionEditor
 from .timeline import PlaybackTimeline
 
 COLORS = ("#52b9f5", "#ffb454", "#74dbb0")
+NAVIGATION_COLOR = "#ff6b6b"
+PARAMETER_CONTROLS = (
+    *("strict", "align", "manual", "mix", "max_lag", "offset", "mode"),
+    *("threshold", "segment", "pairs", "channel", "fft", "hop"),
+)
+THEMES = {
+    # background, panel, foreground, border, muted
+    False: ("#f4f6fa", "#ffffff", "#1e293b", "#d1dbe8", "#64748b"),
+    True: ("#151b27", "#202938", "#e2e9f3", "#344156", "#94a3b8"),
+}
+
+
+def format_clock(seconds):
+    millis = round(seconds * 1000)
+    minutes, millis = divmod(millis, 60000)
+    hours, minutes = divmod(minutes, 60)
+    text = f"{minutes:02d}:{millis // 1000:02d}.{millis % 1000:03d}"
+    return f"{hours}:{text}" if hours else text
 
 
 class Window(QtWidgets.QMainWindow):
@@ -38,16 +56,20 @@ class Window(QtWidgets.QMainWindow):
         )
         self.language = self.preferences.choice("language", ("zh", "en"), default_language)
         self.bindings = []
+        self.foreground = THEMES[False][2]
         self.result = None
         self.spectral_ranges = None
         self.spectral_data = None
-        self.rows = []
+        # Identifies the latest requested spectrum so tab/source switches do not recompute it.
+        self.spectral_key = None
+        self.navigation_sample = None
         self.detail_cache = OrderedDict()
         self.view_cache = ByteCache()
         self.closing = False
         self.restoring = True
         self.preferred_row = None
         self.batch_cancelled = False
+        self.batch_mode = False
         self.panel_widths = [240, 300]
         self.startup_compare = self.preferences.boolean("automation/startup")
         self.restore_paths = self.preferences.boolean("restore_paths")
@@ -93,6 +115,10 @@ class Window(QtWidgets.QMainWindow):
 
     def tr(self, text):
         return translate(text, self.language)
+
+    @property
+    def rows(self):
+        return self.results.rows
 
     def bind(self, widget, text, method="setText"):
         self.bindings.append((widget, text, method))
@@ -240,6 +266,8 @@ class Window(QtWidgets.QMainWindow):
             self.bind(edit, text, "setAccessibleName")
             self.bind(edit, text, "setPlaceholderText")
             edit.setMinimumWidth(80)
+            # Dropping onto one field replaces only that side.
+            edit.installEventFilter(self)
             self.paths.append(edit)
             inputs.addWidget(edit, 1)
             picker = QtWidgets.QToolButton()
@@ -268,16 +296,9 @@ class Window(QtWidgets.QMainWindow):
         ll = QtWidgets.QVBoxLayout(left)
         ll.setContentsMargins(0, 0, 4, 0)
         self.panel_header(ll, 0)
-        self.filter = self.bind(QtWidgets.QLineEdit(), "Filter results…", "setPlaceholderText")
-        ll.addWidget(self.filter)
-        self.table = QtWidgets.QTableWidget(0, 3)
-        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        self.table.verticalHeader().hide()
-        self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.setSortingEnabled(True)
-        ll.addWidget(self.table, 1)
+        self.results = ResultsTable(self.tr)
+        self.filter, self.table = self.results.filter, self.results.table
+        ll.addWidget(self.results, 1)
         self.splitter.addWidget(left)
         middle = QtWidgets.QWidget()
         ml = QtWidgets.QVBoxLayout(middle)
@@ -329,10 +350,17 @@ class Window(QtWidgets.QMainWindow):
         )
         self.wave_plot.addItem(self.region, ignoreBounds=True)
         self.cursors = []
+        self.navigation_lines = []
         for plot in (self.wave_plot, self.diff_plot):
             line = pg.InfiniteLine(angle=90, pen=pg.mkPen("#c6a0f6", style=QtCore.Qt.DashLine))
             plot.addItem(line, ignoreBounds=True)
             self.cursors.append(line)
+            # Difference navigation has its own marker; playback never moves it.
+            marker = pg.InfiniteLine(angle=90, pen=pg.mkPen(NAVIGATION_COLOR, width=1.5))
+            marker.setAcceptedMouseButtons(QtCore.Qt.NoButton)
+            marker.hide()
+            plot.addItem(marker, ignoreBounds=True)
+            self.navigation_lines.append(marker)
         wave_scroll = QtWidgets.QScrollArea()
         wave_scroll.setWidgetResizable(True)
         wave_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
@@ -364,62 +392,24 @@ class Window(QtWidgets.QMainWindow):
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-        panel = QtWidgets.QWidget()
-        form = QtWidgets.QFormLayout(panel)
-        form.setRowWrapPolicy(QtWidgets.QFormLayout.WrapLongRows)
-        form.setContentsMargins(2, 2, 6, 2)
-        self.strict = self.bind(QtWidgets.QCheckBox(), "Strict comparison")
-        self.align = self.bind(QtWidgets.QCheckBox(), "Auto alignment")
-        self.align.setChecked(True)
-        self.manual = self.bind(QtWidgets.QCheckBox(), "Manual offset")
-        self.mix = self.bind(QtWidgets.QCheckBox(), "Mix to mono")
-        for control in (self.strict, self.align, self.manual):
-            form.addRow(control)
-        self.max_lag = QtWidgets.QDoubleSpinBox()
-        self.max_lag.setRange(0, 300)
-        self.max_lag.setValue(5)
-        self.offset = QtWidgets.QSpinBox()
-        self.offset.setRange(-2147483647, 2147483647)
-        self.mode = QtWidgets.QComboBox()
-        self.mode.addItems(["float64", "float32", "pcm16", "pcm24", "pcm32"])
-        self.threshold = QtWidgets.QDoubleSpinBox()
-        self.threshold.setDecimals(12)
-        self.threshold.setRange(0, 4294967295)
-        self.segment = QtWidgets.QSpinBox()
-        self.segment.setRange(1, 2147483647)
-        self.segment.setValue(1000)
-        self.pairs = QtWidgets.QLineEdit()
-        self.pairs.setPlaceholderText("1:1,2:2")
-        self.channel = QtWidgets.QComboBox()
-        self.channel.addItem("1")
-        self.fft = QtWidgets.QComboBox()
-        self.fft.addItems(["256", "512", "1024", "2048", "4096", "8192", "16384"])
-        self.fft.setCurrentText("2048")
-        self.hop = QtWidgets.QSpinBox()
-        self.hop.setRange(1, 16384)
-        self.hop.setValue(512)
-        for text, control in (
-            ("Max lag (s)", self.max_lag),
-            ("Offset (samples)", self.offset),
-            ("Numeric mode", self.mode),
-            ("Threshold", self.threshold),
-            ("Segment (samples)", self.segment),
-            ("Channel pairs", self.pairs),
-        ):
-            form.addRow(self.label(text), control)
-        form.addRow(self.mix)
-        for text, control in (
-            ("Display channel", self.channel),
-            ("FFT size", self.fft),
-            ("Hop size", self.hop),
-        ):
-            form.addRow(self.label(text), control)
-        scroll.setWidget(panel)
-        rl.addWidget(scroll, 2)
-        rl.addWidget(self.label("Results"))
-        self.metrics = QtWidgets.QPlainTextEdit()
-        self.metrics.setReadOnly(True)
-        rl.addWidget(self.metrics, 2)
+        self.parameters = ParametersPanel()
+        # Keep the controls addressable on the window for automation and tests.
+        for name in PARAMETER_CONTROLS:
+            setattr(self, name, getattr(self.parameters, name))
+        scroll.setWidget(self.parameters)
+        # Parameters and results share the side panel; the boundary is user adjustable.
+        self.side_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.side_splitter.setChildrenCollapsible(False)
+        self.side_splitter.addWidget(scroll)
+        report = QtWidgets.QWidget()
+        report_layout = QtWidgets.QVBoxLayout(report)
+        report_layout.setContentsMargins(0, 4, 0, 0)
+        report_layout.addWidget(self.label("Results"))
+        self.metrics = MetricsView(self.tr)
+        report_layout.addWidget(self.metrics, 1)
+        self.side_splitter.addWidget(report)
+        self.side_splitter.setSizes([520, 360])
+        rl.addWidget(self.side_splitter, 1)
         self.splitter.addWidget(right)
         self.panels = [left, right]
         self.splitter.setSizes([240, 884, 300])
@@ -433,8 +423,10 @@ class Window(QtWidgets.QMainWindow):
         self.original = self.bind(QtWidgets.QCheckBox(), "Original input")
         self.loop = self.bind(QtWidgets.QCheckBox(), "Loop selection")
         playback.addWidget(self.original)
-        self.button("Play", self.play, playback)
-        self.button("Pause / resume", self.pause_playback, playback)
+        self.play_button = QtWidgets.QPushButton()
+        self.play_button.setMinimumWidth(72)
+        self.play_button.clicked.connect(self.toggle_playback)
+        playback.addWidget(self.play_button)
         self.button("Stop", self.player.stop, playback)
         playback.addWidget(self.loop)
         volume_group = QtWidgets.QWidget()
@@ -465,6 +457,7 @@ class Window(QtWidgets.QMainWindow):
         self.progress_bar = QtWidgets.QProgressBar()
         self.progress_bar.setRange(0, 1000)
         self.progress_bar.setMaximumWidth(180)
+        self.progress_bar.hide()
         self.statusBar().addPermanentWidget(self.progress_bar)
         self.cancel_button = QtWidgets.QToolButton()
         self.cancel_button.setDefaultAction(self.cancel_action)
@@ -473,9 +466,7 @@ class Window(QtWidgets.QMainWindow):
         self.redraw_timer.setSingleShot(True)
         self.redraw_timer.setInterval(50)
         self.redraw_timer.timeout.connect(self.redraw)
-        for shortcut, callback in (("Space", self.pause_playback),):
-            action = QtGui.QShortcut(QtGui.QKeySequence(shortcut), self)
-            action.activated.connect(callback)
+        QtGui.QShortcut(QtGui.QKeySequence("Space"), self).activated.connect(self.toggle_playback)
 
     def _restore(self, paths):
         prefs = self.preferences
@@ -492,49 +483,7 @@ class Window(QtWidgets.QMainWindow):
         self.language_combo.setCurrentIndex(self.language_combo.findData(self.language))
         theme = prefs.choice("theme", ("system", "light", "dark"), "system")
         self.theme_combo.setCurrentIndex(max(0, self.theme_combo.findData(theme)))
-        options = prefs.object("options")
-        for name in ("strict", "align", "mix"):
-            value = options.get(name, name == "align")
-            getattr(self, name).setChecked(value if isinstance(value, bool) else name == "align")
-        for name, key in (
-            ("max_lag", "max_lag"),
-            ("threshold", "threshold"),
-            ("segment", "segment_size"),
-        ):
-            control = getattr(self, name)
-            control.setValue(
-                prefs.valid_number(
-                    options.get(key),
-                    control.value(),
-                    control.minimum(),
-                    control.maximum(),
-                    isinstance(control, QtWidgets.QSpinBox),
-                )
-            )
-        if options.get("mode") in ("float64", "float32", "pcm16", "pcm24", "pcm32"):
-            self.mode.setCurrentText(options["mode"])
-        self.manual.setChecked(prefs.boolean("analysis/manual", options.get("offset") is not None))
-        old_offset = prefs.valid_number(options.get("offset"), 0, -2147483647, 2147483647, True)
-        self.offset.setValue(prefs.number("analysis/offset", old_offset, -2147483647, 2147483647))
-        try:
-            pairs = options.get("pairs", [])
-            if not isinstance(pairs, list) or any(
-                not isinstance(pair, (list, tuple))
-                or len(pair) != 2
-                or any(type(n) is not int or n < 0 for n in pair)
-                for pair in pairs
-            ):
-                pairs = []
-            self.pairs.setText(",".join(f"{a + 1}:{b + 1}" for a, b in pairs))
-            self.options()
-        except (ValueError, TypeError):
-            self.pairs.clear()
-        self.fft.setCurrentText(
-            prefs.choice(
-                "spectrum/fft", [self.fft.itemText(i) for i in range(self.fft.count())], "2048"
-            )
-        )
-        self.hop.setValue(prefs.number("spectrum/hop", 512, 1, 16384))
+        self.parameters.restore(prefs)
         self.volume.setValue(prefs.number("playback/volume", 50, 0, 100))
         self.source.setCurrentIndex(prefs.number("playback/source", 0, 0, 2))
         self.loop.setChecked(prefs.boolean("playback/loop", False))
@@ -568,17 +517,14 @@ class Window(QtWidgets.QMainWindow):
             edit.textChanged.connect(self.inputs_changed)
             edit.textChanged.connect(edit.setToolTip)
             edit.returnPressed.connect(self.start_compare)
-        for control in (self.strict, self.align, self.manual, self.mix):
-            control.toggled.connect(self.inputs_changed)
-        for control in (self.max_lag, self.offset, self.threshold, self.segment):
-            control.valueChanged.connect(self.inputs_changed)
-        self.mode.currentIndexChanged.connect(self.inputs_changed)
-        self.pairs.textChanged.connect(self.inputs_changed)
-        self.fft.currentIndexChanged.connect(self.spectrum_options_changed)
-        self.hop.valueChanged.connect(self.spectrum_options_changed)
+        self.parameters.optionsChanged.connect(self.inputs_changed)
+        self.parameters.spectrumOptionsChanged.connect(self.spectrum_options_changed)
         self.splitter.splitterMoved.connect(self.panel_sizes_changed)
-        self.filter.textChanged.connect(self.filter_rows)
-        self.table.itemSelectionChanged.connect(self.select_row)
+        self.results.rowSelected.connect(self.select_row)
+        self.jobs.partial.connect(self.job_partial)
+        self.jobs.activityChanged.connect(self.update_progress_visibility)
+        self.player.stateChanged.connect(self.update_play_button)
+        QtGui.QGuiApplication.styleHints().colorSchemeChanged.connect(self.apply_theme)
         self.channel.currentIndexChanged.connect(self.channel_changed)
         self.channel.currentIndexChanged.connect(self.show_metrics)
         self.channel.currentIndexChanged.connect(self.update_spectrum)
@@ -591,7 +537,7 @@ class Window(QtWidgets.QMainWindow):
         self.selection_editor.preferencesChanged.connect(self.schedule_save)
         self.selection_editor.message.connect(self.message)
         self.tabs.currentChanged.connect(self.update_spectrum)
-        self.source.currentIndexChanged.connect(self.update_spectrum)
+        self.source.currentIndexChanged.connect(self.show_spectrogram_source)
         self.volume.valueChanged.connect(lambda n: self.player.set_volume(n / 100))
         self.seek.seekRequested.connect(self.seek_play)
         self.seek.selectionPreview.connect(self.selection_preview)
@@ -693,8 +639,7 @@ class Window(QtWidgets.QMainWindow):
             "automation/enabled": self.auto_compare_action.isChecked(),
             "automation/startup": self.startup_compare,
             "restore_paths": self.restore_paths,
-            "spectrum/fft": self.fft.currentText(),
-            "spectrum/hop": self.hop.value(),
+            **self.parameters.settings_values(),
             "playback/volume": self.volume.value(),
             "playback/source": self.source.currentIndex(),
             "playback/loop": self.loop.isChecked(),
@@ -710,12 +655,6 @@ class Window(QtWidgets.QMainWindow):
             values[f"indicators/{name}"] = indicator.toggle.isChecked()
         for i, path in enumerate(self.paths):
             values[f"path{i}"] = path.text() if self.restore_paths else ""
-        try:
-            values["options"] = json.dumps(self.options().report())
-            values["analysis/manual"] = self.manual.isChecked()
-            values["analysis/offset"] = self.offset.value()
-        except ValueError:
-            pass
         for key, value in values.items():
             self.settings.setValue(key, value)
         self.settings.sync()
@@ -787,38 +726,9 @@ class Window(QtWidgets.QMainWindow):
         )
 
     def options(self, region=None):
-        options = Options(
-            strict=self.strict.isChecked(),
-            align=self.align.isChecked(),
-            max_lag=self.max_lag.value(),
-            offset=self.offset.value()
-            if self.manual.isChecked() and not self.strict.isChecked()
-            else None,
-            threshold=self.threshold.value(),
-            segment_size=self.segment.value(),
-            mode=self.mode.currentText(),
-            pairs=channel_pairs(self.pairs.text()),
-            mix=self.mix.isChecked(),
-            region=region,
-        )
-        options.validate()
-        return options
+        return self.parameters.options(region)
 
-    def invalidate(self, *_):
-        self.compare_timer.stop()
-        self.spectrum_timer.stop()
-        self.redraw_timer.stop()
-        self.reset_indicators()
-        self.spectral_data = None
-        self.jobs.cancel_all()
-        self.player.stop()
-        self.result = None
-        self.reset_playback()
-        self.spectral_ranges = None
-        self.rows = []
-        self.table.setRowCount(0)
-        self.detail_cache.clear()
-        self.view_cache.clear()
+    def clear_plots(self):
         for curve in [
             *self.wave_curves,
             self.diff_curve,
@@ -827,7 +737,30 @@ class Window(QtWidgets.QMainWindow):
         ]:
             curve.setData([], [])
         self.image.clear()
-        self.metrics.clear()
+
+    def cancel_views(self):
+        """Cancel all per-result work while a running batch keeps streaming rows."""
+        for kind in list(self.jobs.latest):
+            if kind != "batch":
+                self.jobs.cancel_kind(kind)
+
+    def invalidate(self, *_):
+        self.compare_timer.stop()
+        self.spectrum_timer.stop()
+        self.redraw_timer.stop()
+        self.reset_indicators()
+        self.spectral_data = None
+        self.spectral_key = None
+        self.jobs.cancel_all()
+        self.player.stop()
+        self.result = None
+        self.reset_playback()
+        self.spectral_ranges = None
+        self.results.clear()
+        self.detail_cache.clear()
+        self.view_cache.clear()
+        self.clear_plots()
+        self.metrics.clear_report()
         self.refresh_actions()
         self.message("Settings changed; compare again.")
 
@@ -838,10 +771,13 @@ class Window(QtWidgets.QMainWindow):
             path = QtWidgets.QFileDialog.getExistingDirectory(self, self.tr("Folder…"), initial)
         else:
             path, _ = QtWidgets.QFileDialog.getOpenFileName(
-                self, self.tr("File…"), initial, "WAV (*.wav *.WAV *.rf64 *.w64)"
+                self,
+                self.tr("File…"),
+                initial,
+                "WAV (*.wav *.WAV *.rf64 *.RF64 *.w64 *.W64);;* (*)",
             )
         if path:
-            self.paths[side].setText(path)
+            self.paths[side].setText(QtCore.QDir.toNativeSeparators(path))
 
     def swap(self):
         a, b = (edit.text() for edit in self.paths)
@@ -862,17 +798,19 @@ class Window(QtWidgets.QMainWindow):
             a, b, options = self.comparison_inputs()
             self.invalidate()
             self.batch_cancelled = False
+            self.batch_mode = not (Path(a).is_file() and Path(b).is_file())
             self.message("Loading…")
-            if Path(a).is_file() and Path(b).is_file():
+            if not self.batch_mode:
                 self.jobs.submit(
                     "detail", lambda cancel, progress: compare(a, b, options, cancel, progress)
                 )
             else:
                 self.jobs.submit(
                     "batch",
-                    lambda cancel, progress: run_batch(
-                        discover(a, b, cancel), options, cancel, progress
+                    lambda cancel, progress, emit: run_batch(
+                        discover(a, b, cancel), options, cancel, progress, emit
                     ),
+                    streaming=True,
                 )
         except Exception as error:
             self.message(str(error))
@@ -886,9 +824,7 @@ class Window(QtWidgets.QMainWindow):
         # Keep the batch's final partial report, but prevent queued view/detail work.
         for job in self.jobs.jobs.values():
             job.cancel.cancel()
-        for kind in list(self.jobs.latest):
-            if kind != "batch":
-                self.jobs.cancel_kind(kind)
+        self.cancel_views()
         self.player.stop()
         self.refresh_actions()
         self.message("Cancelled")
@@ -897,43 +833,75 @@ class Window(QtWidgets.QMainWindow):
         self.progress_bar.setValue(round(value * 1000))
         self.message(text)
 
+    def update_progress_visibility(self):
+        # Only analysis work reports progress; hide stale values once it stops.
+        busy = any(kind in self.jobs.latest for kind in ("batch", "detail"))
+        if not busy:
+            self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(busy)
+
+    def analyzable(self, index):
+        return self.rows[index]["status"] not in ANALYZABLE_EXCLUDED
+
+    def job_partial(self, kind, row):
+        if kind != "batch":
+            return
+        self.results.append_row(row)
+        self.refresh_actions()
+        index = len(self.rows) - 1
+        # Open the remembered path as soon as it arrives, or else the first analyzable row.
+        wanted = self.preferred_row is None or row["name"] == self.preferred_row
+        if (
+            not self.batch_cancelled
+            and self.results.selected_index() is None
+            and wanted
+            and self.analyzable(index)
+        ):
+            self.results.select_index(index)
+
     def job_done(self, kind, outcome):
         success, value = outcome
         if not success:
             self.message(value)
             return
         if kind == "batch":
-            self.rows = value
-            self.populate_rows()
-            if not self.batch_cancelled:
-                candidates = [
-                    i
-                    for i, row in enumerate(self.rows)
-                    if row["status"] not in ("missing", "collision", "error", "cancelled")
-                ]
+            selected = self.results.selected_index()
+            selected_name = self.rows[selected]["name"] if selected is not None else None
+            self.results.set_rows(value)
+            if selected_name is not None:
+                # Streaming already opened this row; restore the highlight without reloading.
+                index = next(i for i, row in enumerate(self.rows) if row["name"] == selected_name)
+                with QtCore.QSignalBlocker(self.table):
+                    self.results.select_index(index)
+            elif not self.batch_cancelled:
+                candidates = [i for i in range(len(self.rows)) if self.analyzable(i)]
                 chosen = next(
                     (i for i in candidates if self.rows[i]["name"] == self.preferred_row),
                     next(iter(candidates), None),
                 )
                 if chosen is not None:
-                    for i in range(self.table.rowCount()):
-                        if self.table.item(i, 0).data(QtCore.Qt.UserRole) == chosen:
-                            self.table.selectRow(i)
-                            break
-            else:
+                    self.results.select_index(chosen)
+            self.refresh_actions()
+            if self.batch_cancelled:
                 self.message("Cancelled")
+            elif self.result is None and not self.jobs.latest:
+                self.message(f"{self.tr('Complete')} · {len(self.rows)}")
         elif kind == "detail":
             self.set_result(value)
             if not self.rows:
-                self.rows = [
-                    {
-                        "name": Path(value.a_path).name,
-                        "a_path": value.report["a"]["path"],
-                        "b_path": value.report["b"]["path"],
-                        **value.report,
-                    }
-                ]
-                self.populate_rows()
+                self.results.set_rows(
+                    [
+                        {
+                            "name": Path(value.a_path).name,
+                            "a_path": value.report["a"]["path"],
+                            "b_path": value.report["b"]["path"],
+                            **value.report,
+                        }
+                    ]
+                )
+                with QtCore.QSignalBlocker(self.table):
+                    self.results.select_index(0)
+                self.refresh_actions()
         elif kind == "view":
             key, data = value
             self.view_cache.put(key, data)
@@ -948,85 +916,45 @@ class Window(QtWidgets.QMainWindow):
             revision, x, fields = value
             self.indicators[kind.split(":", 1)[1]].finish(revision, x, fields)
         elif kind == "navigate":
-            if value is not None:
+            if value is None:
+                self.message("No further differences")
+            else:
                 self.zoom_to(value)
 
-    def populate_rows(self):
-        self.table.blockSignals(True)
-        self.table.setSortingEnabled(False)
-        self.table.setRowCount(len(self.rows))
-        for i, row in enumerate(self.rows):
-            maximum = max((m["max_abs"] for m in row.get("metrics", [])), default=None)
-            for j, value in enumerate(
-                (
-                    row["name"],
-                    self.tr(row["status"]),
-                    f"{maximum:.6g}" if maximum is not None else "—",
-                )
-            ):
-                item = QtWidgets.QTableWidgetItem(value)
-                item.setData(QtCore.Qt.UserRole, i)
-                item.setToolTip(row.get("error", row["name"]))
-                self.table.setItem(i, j, item)
-        self.table.setSortingEnabled(True)
-        self.table.blockSignals(False)
-        self.filter_rows()
-        self.refresh_actions()
-        self.message(f"{self.tr('Complete')} · {len(self.rows)}")
+    @staticmethod
+    def detail_key(a, b, options):
+        """Cache key for a detail result; a file change on disk yields a new key."""
+        sa, sb = Path(a).stat(), Path(b).stat()
+        return (str(a), str(b), sa.st_mtime_ns, sb.st_mtime_ns, sa.st_size, sb.st_size, options)
 
-    def filter_rows(self):
-        query = self.filter.text().casefold()
-        for row in range(self.table.rowCount()):
-            text = " ".join(self.table.item(row, col).text() for col in range(3))
-            self.table.setRowHidden(row, query not in text.casefold())
-
-    def select_row(self):
-        selected = self.table.selectedItems()
-        if not selected:
+    def select_row(self, index=None):
+        index = self.results.selected_index() if index is None else index
+        if index is None:
             return
-        row = self.rows[selected[0].data(QtCore.Qt.UserRole)]
+        row = self.rows[index]
         self.preferred_row = row["name"]
         self.spectrum_timer.stop()
-        self.jobs.cancel_all()
+        self.cancel_views()
         self.player.stop()
         self.result = None
         self.reset_playback()
         self.refresh_actions()
         self.view_cache.clear()
-        for curve in [
-            *self.wave_curves,
-            self.diff_curve,
-            *self.segment_curves,
-            *self.spectrum_curves,
-        ]:
-            curve.setData([], [])
-        self.image.clear()
+        self.clear_plots()
         self.reset_indicators()
         self.spectral_data = None
         if row["status"] in ("missing", "collision"):
-            self.metrics.setPlainText(json.dumps(row, ensure_ascii=False, indent=2))
+            self.metrics.show_row(row)
             return
         try:
             options = self.options()
             a, b = str(Path(row["a_path"]).resolve()), str(Path(row["b_path"]).resolve())
-            key = (
-                a,
-                b,
-                Path(a).stat().st_mtime_ns,
-                Path(b).stat().st_mtime_ns,
-                Path(a).stat().st_size,
-                Path(b).stat().st_size,
-                options,
-            )
-            cached = self.detail_cache.get(key)
-            self.jobs.cancel_all()
-            self.player.stop()
-            self.result = None
-            self.reset_indicators()
-            self.spectral_data = None
+            cached = self.detail_cache.get(self.detail_key(a, b, options))
             if cached:
                 self.set_result(cached)
             else:
+                self.metrics.clear_report()
+                self.message("Loading…")
                 self.jobs.submit(
                     "detail", lambda cancel, progress: compare(a, b, options, cancel, progress)
                 )
@@ -1035,35 +963,35 @@ class Window(QtWidgets.QMainWindow):
 
     def set_result(self, result):
         self.player.stop()
-        self.jobs.cancel_all()
+        self.cancel_views()
         self.reset_indicators()
         self.spectral_data = None
+        self.spectral_key = None
+        self.navigation_sample = None
+        for line in self.navigation_lines:
+            line.hide()
         self.result = result
         self.refresh_actions()
         self.spectral_ranges = None
         a, b = result.report["a"], result.report["b"]
-        key = (
-            a["path"],
-            b["path"],
-            a["mtime_ns"],
-            b["mtime_ns"],
-            a["size"],
-            b["size"],
-            result.options,
-        )
+        key = (a["path"], b["path"], a["mtime_ns"], b["mtime_ns"], a["size"], b["size"])
+        key = (*key, result.options)
         self.detail_cache[key] = result
         self.detail_cache.move_to_end(key)
         while len(self.detail_cache) > 2:
             self.detail_cache.popitem(last=False)
         self.view_cache.clear()
-        self.channel.blockSignals(True)
-        self.channel.clear()
-        self.channel.addItems(
-            [f"{m['a_channel']} → {m['b_channel']}" for m in result.report["metrics"]]
-        )
-        self.channel.blockSignals(False)
+        # Keep the displayed channel when the new result has it (e.g. switching batch rows).
+        previous = max(0, self.channel.currentIndex())
+        with QtCore.QSignalBlocker(self.channel):
+            self.channel.clear()
+            self.channel.addItems(
+                [f"{m['a_channel']} → {m['b_channel']}" for m in result.report["metrics"]]
+            )
+            self.channel.setCurrentIndex(previous if previous < self.channel.count() else 0)
         duration = result.frames / result.rate
         self.seek.set_duration(duration, result.rate)
+        self.update_overview()
         self.selection_editor.set_context(result.rate, result.frames)
         self.region.setBounds((0, result.frames / result.rate))
         self.region.setRegion((0, min(10.0, result.frames / result.rate)))
@@ -1075,37 +1003,27 @@ class Window(QtWidgets.QMainWindow):
         self.update_spectrum()
         self.message("Complete")
 
+    def update_overview(self):
+        if self.result:
+            self.seek.set_overview(
+                *difference_overview(self.result, max(0, self.channel.currentIndex()))
+            )
+
     def channel_changed(self):
         self.reset_indicators()
         self.spectral_data = None
+        self.navigation_sample = None
+        for line in self.navigation_lines:
+            line.hide()
         for kind in ("view", "spectrum", "segments", "navigate"):
             self.jobs.cancel_kind(kind)
         self.player.stop()
+        self.update_overview()
         self.reset_zoom()
 
     def show_metrics(self):
-        if not self.result:
-            return
-        r = self.result.report
-        ch = max(0, self.channel.currentIndex())
-        m = r["metrics"][ch]
-        text = (
-            f"{self.tr(r['status'])}\n"
-            f"{r['analysis_samplerate']:,} Hz · {r['frames_compared']:,} {self.tr('samples')}\n"
-            f"{self.tr('Domain')}: {self.tr(r['comparison_domain'])}\n"
-            f"{self.tr('Resampled B')}: {self.tr(str(r['resampled_b']))}\n"
-            f"{self.tr('Alignment')}: {self.tr(r['alignment']['status'])}\n"
-            f"{self.tr('Lag')}: {r['alignment']['lag_samples']} {self.tr('samples')}\n\n"
-            + "\n".join(
-                f"{self.tr(key)}: {value:.9g}"
-                if isinstance(value, float)
-                else f"{self.tr(key)}: {self.tr(str(value))}"
-                for key, value in m.items()
-            )
-            + f"\n\n{self.tr('Excluded')}:\n"
-            + "\n".join(f"{self.tr(k)}: {self.tr(str(v))}" for k, v in r["excluded"].items())
-        )
-        self.metrics.setPlainText(text)
+        if self.result:
+            self.metrics.show_report(self.result.report, max(0, self.channel.currentIndex()))
 
     def reset_zoom(self):
         self.reset_indicators()
@@ -1131,7 +1049,7 @@ class Window(QtWidgets.QMainWindow):
         self.wave_plot.setXRange(0, duration, padding=0)
         self.reset_spectral_zoom()
         for line in self.cursors:
-            line.setPos(0)
+            line.setPos(self.playback_position)
         self.redraw_timer.start()
 
     def redraw(self):
@@ -1152,21 +1070,24 @@ class Window(QtWidgets.QMainWindow):
             )
 
         def segment_view(cancel, progress):
-            data = result.segment_data()
-            start = max(0, int(lo * result.rate / result.options.segment_size))
-            stop = min(len(data), int(hi * result.rate / result.options.segment_size) + 1)
+            store, size = result.segment_data(), result.options.segment_size
+            start = max(0, int(lo * result.rate / size))
+            stop = min(len(store), int(hi * result.rate / size) + 1)
             if stop <= start:
                 return np.array([]), np.array([]), np.array([])
             stride = max(1, int(np.ceil((stop - start) / pixels)))
-            # Aggregate without dropping high-error segments.
+            # Aggregate without dropping high-error segments; blocks are stride-aligned.
             x, maxima, means = [], [], []
-            for i in range(start, stop, stride):
-                cancel.check()
-                group = data[i : min(i + stride, stop), channel]
-                x.append(i * result.options.segment_size / result.rate)
-                maxima.append(group[:, 0].max())
-                means.append(group[:, 1].sum() / max(1, group[:, 3].sum()))
-            return np.array(x), np.array(maxima), np.array(means)
+            block = stride * max(1, 65536 // stride)
+            with closing(store.blocks(start, stop, channel, block)) as blocks:
+                for first, rows in blocks:
+                    cancel.check()
+                    edges = np.arange(0, len(rows), stride)
+                    x.append((first + edges) * size / result.rate)
+                    maxima.append(np.maximum.reduceat(rows[:, 0], edges))
+                    counts = np.maximum(1, np.add.reduceat(rows[:, 3], edges))
+                    means.append(np.add.reduceat(rows[:, 1], edges) / counts)
+            return np.concatenate(x), np.concatenate(maxima), np.concatenate(means)
 
         self.jobs.submit("segments", segment_view)
 
@@ -1225,23 +1146,31 @@ class Window(QtWidgets.QMainWindow):
         )
         options = replace(result.options, region=region)
         a, b = result.report["a"]["path"], result.report["b"]["path"]
-        self.jobs.cancel_all()
+        self.cancel_views()
         self.player.stop()
+        self.message("Loading…")
         self.jobs.submit(
             "detail", lambda cancel, progress: compare(a, b, options, cancel, progress)
         )
 
     def update_spectrum(self, *_):
         self.spectrum_timer.stop()
-        self.reset_indicators(("spectrum", "spectrogram"))
-        self.spectral_data = None
-        self.jobs.cancel_kind("spectrum")
         if not self.result or self.tabs.currentIndex() == 0:
+            self.jobs.cancel_kind("spectrum")
             return
         result = self.result
         begin, end = self.selection_editor.seconds
         ch = max(0, self.channel.currentIndex())
         fft, hop = int(self.fft.currentText()), self.hop.value()
+        key = (id(result), self.selection_editor.bounds, ch, fft, hop)
+        # Switching between spectral tabs reuses a finished or still-running identical request.
+        if key == self.spectral_key and (
+            self.spectral_data is not None or "spectrum" in self.jobs.latest
+        ):
+            return
+        self.reset_indicators(("spectrum", "spectrogram"))
+        self.spectral_data = None
+        self.spectral_key = key
         bounds = (
             max(0, round(begin * result.rate)) / result.rate,
             min(result.frames, round(end * result.rate)) / result.rate,
@@ -1278,6 +1207,15 @@ class Window(QtWidgets.QMainWindow):
         self.image.setRect(QtCore.QRectF(left, 0, right - left, nyquist))
         self.reset_spectral_zoom()
         self.message("Complete")
+
+    def show_spectrogram_source(self, *_):
+        """All sources were analyzed together; switching only swaps the displayed image."""
+        self.reset_indicators(("spectrogram",))
+        if self.spectral_data is not None:
+            images = self.spectral_data[3]
+            self.image.setImage(
+                images[self.source.currentIndex()], levels=(-120, 0), autoLevels=False
+            )
 
     def reset_spectral_zoom(self):
         if self.spectral_ranges is None:
@@ -1382,43 +1320,64 @@ class Window(QtWidgets.QMainWindow):
             )
 
     def zoom_to(self, sample):
-        if self.result:
-            center = sample / self.result.rate
-            self.wave_plot.setXRange(
-                max(0, center - 0.1),
-                min(self.result.frames / self.result.rate, center + 0.1),
-                padding=0.1,
-            )
-            for line in self.cursors:
-                line.setPos(center)
+        if not self.result:
+            return
+        center = sample / self.result.rate
+        self.wave_plot.setXRange(
+            max(0, center - 0.1),
+            min(self.result.frames / self.result.rate, center + 0.1),
+            padding=0.1,
+        )
+        self.navigation_sample = int(sample)
+        for line in self.navigation_lines:
+            line.setPos(center)
+            line.show()
+        # A stopped, unlooped player starts from the difference so it can be heard directly.
+        if self.player.state == "stopped" and not self.loop.isChecked():
+            self.play_position(center)
 
     def next_difference(self, direction):
         if not self.result:
             return
         result, channel = self.result, max(0, self.channel.currentIndex())
-        current = round(self.cursors[0].value() * result.rate)
+        size, threshold = result.options.segment_size, result.options.threshold
+        # Continue from the last visited difference, else from (and including) playback.
+        if self.navigation_sample is None:
+            current = first = round(self.playback_position * result.rate)
+        else:
+            current, first = self.navigation_sample, self.navigation_sample + 1
 
         def find(cancel, progress):
-            data = result.segment_data()
-            seg = current // result.options.segment_size
-            iterator = range(seg, len(data)) if direction > 0 else range(seg, -1, -1)
-            for index in iterator:
-                cancel.check()
-                if data[index, channel, 0] > result.options.threshold:
-                    start = index * result.options.segment_size
-                    end = min(result.frames, start + result.options.segment_size)
-                    if direction > 0:
-                        start = max(start, current + 1)
-                        chunks = range(start, end, 65536)
-                    else:
-                        end = min(end, current)
-                        chunks = reversed(range(start, end, 65536))
-                    for chunk in chunks:
-                        cancel.check()
-                        d = result.samples(chunk, min(65536, end - chunk))[2][:, channel]
-                        hits = np.flatnonzero(np.abs(d) > result.options.threshold)
-                        if len(hits):
-                            return chunk + int(hits[0 if direction > 0 else -1])
+            def scan(start, end):
+                chunks = range(start, end, 65536)
+                for chunk in chunks if direction > 0 else reversed(chunks):
+                    cancel.check()
+                    d = result.samples(chunk, min(65536, end - chunk))[2][:, channel]
+                    hits = np.flatnonzero(np.abs(d) > threshold)
+                    if len(hits):
+                        return chunk + int(hits[0 if direction > 0 else -1])
+                return None
+
+            store = result.segment_data()
+            if direction > 0:
+                blocks = store.blocks(first // size, len(store), channel)
+            else:
+                blocks = store.blocks(0, current // size + 1, channel, reverse=True)
+            # Read segment maxima in blocks, then scan samples only inside candidate segments.
+            with closing(blocks):
+                for base, rows in blocks:
+                    cancel.check()
+                    hits = np.flatnonzero(rows[:, 0] > threshold) + base
+                    for index in hits if direction > 0 else hits[::-1]:
+                        start = int(index) * size
+                        end = min(result.frames, start + size)
+                        found = (
+                            scan(max(start, first), end)
+                            if direction > 0
+                            else scan(start, min(end, current))
+                        )
+                        if found is not None:
+                            return found
             return None
 
         self.jobs.submit("navigate", find)
@@ -1427,9 +1386,12 @@ class Window(QtWidgets.QMainWindow):
         self.selection_editor.set_context(1, 0)
         self.seek.set_duration(0, 1)
         self.playback_position = 0.0
-        self.time_label.setText("00:00.000 / 00:00.000")
+        self.navigation_sample = None
+        self.time_label.setText(f"{format_clock(0)} / {format_clock(0)}")
         for line in self.cursors:
             line.setPos(0)
+        for line in self.navigation_lines:
+            line.hide()
 
     def playback_bounds(self):
         if not self.result:
@@ -1494,20 +1456,30 @@ class Window(QtWidgets.QMainWindow):
         else:
             self.player.pause()
 
+    def toggle_playback(self):
+        """Play when stopped; otherwise pause or resume (Space and the play button)."""
+        if self.player.state == "stopped":
+            self.play()
+        else:
+            self.pause_playback()
+
+    def update_play_button(self, *_):
+        playing = self.player.state == "playing"
+        self.play_button.setText(self.tr("Pause" if playing else "Play"))
+        self.play_button.setIcon(
+            self.style().standardIcon(
+                QtWidgets.QStyle.SP_MediaPause if playing else QtWidgets.QStyle.SP_MediaPlay
+            )
+        )
+
     def play_position(self, seconds):
         if self.result:
             self.playback_position = max(0.0, min(seconds, self.seek.duration))
             if self.seek.interacting:
                 return
             self.seek.set_position(self.playback_position)
-
-            def format_time(value):
-                millis = round(value * 1000)
-                minutes, millis = divmod(millis, 60000)
-                return f"{minutes:02d}:{millis // 1000:02d}.{millis % 1000:03d}"
-
             self.time_label.setText(
-                f"{format_time(self.playback_position)} / {format_time(self.seek.duration)}"
+                f"{format_clock(self.playback_position)} / {format_clock(self.seek.duration)}"
             )
             for line in self.cursors:
                 line.setPos(self.playback_position)
@@ -1524,7 +1496,8 @@ class Window(QtWidgets.QMainWindow):
 
     def export(self, kind):
         rows = self.rows
-        if self.result and len(rows) <= 1:
+        # Single-file export reflects the current (possibly selection) analysis.
+        if self.result and not self.batch_mode:
             rows = [{"name": Path(self.result.a_path).name, **self.result.report}]
         if not rows:
             self.message("No results to export")
@@ -1564,28 +1537,26 @@ class Window(QtWidgets.QMainWindow):
             indicator.retranslate()
         for widget, text, method in self.bindings:
             getattr(widget, method)(self.tr(text))
+        self.parameters.retranslate(self.tr)
+        self.results.retranslate()
+        self.metrics.retranslate()
+        self.update_play_button()
         for i, text in enumerate(("Waveform", "Spectrum", "Spectrogram")):
             self.tabs.setTabText(i, self.tr(text))
         for i, text in enumerate(("System", "Light", "Dark")):
             self.theme_combo.setItemText(i, self.tr(text))
-        self.table.setHorizontalHeaderLabels(
-            [self.tr(t) for t in ("Name", "Status", "Max difference")]
-        )
         for plot, title in (
             (self.wave_plot, "A / B waveforms"),
             (self.diff_plot, "B − A difference"),
             (self.segment_plot, "Segment differences"),
         ):
-            plot.setTitle(self.tr(title))
+            plot.setTitle(self.tr(title), color=self.foreground)
             plot.setLabel("bottom", self.tr("Time (s)"))
             plot.setLabel("left", self.tr("Amplitude"))
         self.spectrum_plot.setLabel("bottom", self.tr("Frequency (Hz)"))
         self.spectrum_plot.setLabel("left", self.tr("PSD (dB/Hz)"))
         self.spectrogram_plot.setLabel("bottom", self.tr("Time (s)"))
         self.spectrogram_plot.setLabel("left", self.tr("Frequency (Hz)"))
-        if self.rows:
-            self.populate_rows()
-        self.show_metrics()
 
     def apply_theme(self):
         choice = self.theme_combo.currentData()
@@ -1593,18 +1564,49 @@ class Window(QtWidgets.QMainWindow):
             choice == "system"
             and QtGui.QGuiApplication.styleHints().colorScheme() == QtCore.Qt.ColorScheme.Dark
         )
-        bg, panel, fg, border = (
-            ("#151b27", "#202938", "#e2e9f3", "#344156")
-            if dark
-            else ("#f4f6fa", "#ffffff", "#1e293b", "#d1dbe8")
-        )
+        bg, panel, fg, border, muted = THEMES[dark]
+        self.foreground = fg
         for indicator in self.indicators.values():
             indicator.apply_theme(dark)
         self.seek.apply_theme(dark)
+        # A matching palette themes natively drawn parts: check marks, scroll bars, tooltips.
+        palette = QtGui.QPalette()
+        for role, color in (
+            (QtGui.QPalette.Window, bg),
+            (QtGui.QPalette.WindowText, fg),
+            (QtGui.QPalette.Base, panel),
+            (QtGui.QPalette.AlternateBase, bg),
+            (QtGui.QPalette.Text, fg),
+            (QtGui.QPalette.Button, panel),
+            (QtGui.QPalette.ButtonText, fg),
+            (QtGui.QPalette.ToolTipBase, panel),
+            (QtGui.QPalette.ToolTipText, fg),
+            (QtGui.QPalette.PlaceholderText, muted),
+            (QtGui.QPalette.Mid, border),
+            (QtGui.QPalette.Highlight, "#277ab8"),
+            (QtGui.QPalette.HighlightedText, "#ffffff"),
+        ):
+            palette.setColor(role, QtGui.QColor(color))
+        for role in (QtGui.QPalette.Text, QtGui.QPalette.ButtonText, QtGui.QPalette.WindowText):
+            palette.setColor(QtGui.QPalette.Disabled, role, QtGui.QColor(muted))
+        self.setPalette(palette)
+        QtWidgets.QToolTip.setPalette(palette)
         self.setStyleSheet(f"""
             QMainWindow, QWidget {{ background: {bg}; color: {fg}; font-size: 12px; }}
-            QLineEdit, QAbstractSpinBox, QComboBox, QPlainTextEdit, QTableWidget {{
+            QLineEdit, QAbstractSpinBox, QComboBox, QPlainTextEdit, QTableWidget, QTreeWidget {{
                 background: {panel}; border: 1px solid {border}; border-radius: 4px; padding: 5px; }}
+            QTableWidget, QTreeWidget {{ alternate-background-color: {bg}; }}
+            QLineEdit[invalid="true"] {{ border: 1px solid #e5534b; }}
+            QAbstractSpinBox:disabled, QComboBox:disabled, QLineEdit:disabled,
+            QCheckBox:disabled, QLabel:disabled {{ color: {muted}; }}
+            QGroupBox {{ border: 1px solid {border}; border-radius: 6px; margin-top: 16px;
+                padding-top: 4px; font-weight: 600; }}
+            QGroupBox::title {{ subcontrol-origin: margin; left: 8px; padding: 0 4px; }}
+            QCheckBox::indicator {{ width: 12px; height: 12px; border-radius: 3px;
+                border: 1px solid {muted}; background: {panel}; }}
+            QCheckBox::indicator:checked {{ background: #277ab8; border-color: #277ab8; }}
+            QCheckBox::indicator:disabled {{ border-color: {border}; }}
+            QCheckBox::indicator:checked:disabled {{ background: {muted}; border-color: {muted}; }}
             QPushButton, QToolButton {{ background: {panel}; border: 1px solid {border}; border-radius: 4px; padding: 4px 7px; }}
             QPushButton:hover, QToolButton:hover {{ border-color: #4298d8; }}
             QToolButton:checked {{ background: {border}; }}
@@ -1629,6 +1631,11 @@ class Window(QtWidgets.QMainWindow):
             for name in ("bottom", "left"):
                 plot.getAxis(name).setPen(fg)
                 plot.getAxis(name).setTextPen(fg)
+            legend = plot.getPlotItem().legend
+            if legend is not None:
+                legend.setLabelTextColor(fg)
+        for plot in (self.wave_plot, self.diff_plot, self.segment_plot):
+            plot.setTitle(plot.getPlotItem().titleLabel.text, color=fg)
 
     def about(self):
         QtWidgets.QMessageBox.about(
@@ -1641,10 +1648,43 @@ class Window(QtWidgets.QMainWindow):
         if event.mimeData().hasUrls() and all(url.isLocalFile() for url in event.mimeData().urls()):
             event.acceptProposedAction()
 
+    @staticmethod
+    def dropped_paths(mime):
+        if not mime.hasUrls() or not all(url.isLocalFile() for url in mime.urls()):
+            return []
+        return [QtCore.QDir.toNativeSeparators(url.toLocalFile()) for url in mime.urls()]
+
+    def drop_paths(self, paths, side=None):
+        """Two paths set A/B; one path fills the target side, else the first empty side."""
+        if len(paths) >= 2:
+            self.set_paths(paths[:2])
+            return
+        values = [edit.text() for edit in self.paths]
+        if side is None:
+            side = 0 if not values[0].strip() else 1
+        values[side] = paths[0]
+        self.set_paths(values)
+
     def dropEvent(self, event):
-        paths = [url.toLocalFile() for url in event.mimeData().urls()]
-        self.set_paths(paths[:2])
-        event.acceptProposedAction()
+        paths = self.dropped_paths(event.mimeData())
+        if paths:
+            self.drop_paths(paths)
+            event.acceptProposedAction()
+
+    def eventFilter(self, watched, event):
+        if watched in getattr(self, "paths", ()):
+            kind = event.type()
+            if kind in (QtCore.QEvent.DragEnter, QtCore.QEvent.DragMove):
+                if self.dropped_paths(event.mimeData()):
+                    event.acceptProposedAction()
+                    return True
+            elif kind == QtCore.QEvent.Drop:
+                paths = self.dropped_paths(event.mimeData())
+                if paths:
+                    self.drop_paths(paths, self.paths.index(watched))
+                    event.acceptProposedAction()
+                    return True
+        return super().eventFilter(watched, event)
 
     def closeEvent(self, event):
         self.closing = True

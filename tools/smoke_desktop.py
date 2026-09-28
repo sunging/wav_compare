@@ -45,20 +45,23 @@ def main():
     window.resize(args.width, args.height)
     window.language_combo.setCurrentIndex(window.language_combo.findData(args.language))
     window.theme_combo.setCurrentIndex(window.theme_combo.findData(args.theme))
-    with QtCore.QSignalBlocker(window.strict):
+    with QtCore.QSignalBlocker(window.parameters):
         window.strict.setChecked(True)
     result = compare(root / "reference.wav", root / "candidate.wav", Options(strict=True))
     window.set_result(result)
     window.selection_editor.set_preferences(args.selection_format, args.selection_mode)
-    window.rows = [
-        {
-            "name": "demo / reference ↔ candidate",
-            "a_path": result.a_path,
-            "b_path": result.b_path,
-            **result.report,
-        }
-    ]
-    window.populate_rows()
+    window.results.set_rows(
+        [
+            {
+                "name": "demo / reference ↔ candidate",
+                "a_path": result.a_path,
+                "b_path": result.b_path,
+                **result.report,
+            }
+        ]
+    )
+    with QtCore.QSignalBlocker(window.table):
+        window.results.select_index(0)
     window.show()
     if args.collapse_panels:
         for action in window.panel_actions:

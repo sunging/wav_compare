@@ -399,3 +399,19 @@ def test_close_waits_for_cancelled_audio_workers(window, qtbot):
         finished.set()
         worker.join(timeout=2)
     qtbot.waitUntil(lambda: not window.isVisible(), timeout=5000)
+
+
+def test_space_toggle_starts_pauses_and_resumes(window, qtbot):
+    qtbot.waitUntil(lambda: not window.jobs.jobs, timeout=5000)
+    play, pause = window.tr("Play"), window.tr("Pause")
+    assert window.play_button.text() == play
+    window.toggle_playback()
+    assert window.player.state == "playing"
+    assert window.play_button.text() == pause
+    window.toggle_playback()
+    assert window.player.state == "paused"
+    assert window.play_button.text() == play
+    window.toggle_playback()
+    assert window.player.state == "playing"
+    window.player.stop()
+    assert window.play_button.text() == play

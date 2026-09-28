@@ -207,7 +207,7 @@ def test_cancel_batch_keeps_partial_report_without_detail(
     for folder in ("left", "right"):
         audio(f"{folder}/a.wav", np.zeros(80))
 
-    def batch(rows, options, cancel, progress):
+    def batch(rows, options, cancel, progress, on_result=None):
         entered.set()
         release.wait(5)
         assert cancel.event.is_set()

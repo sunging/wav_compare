@@ -254,12 +254,21 @@ def test_difference_in_current_segment(qtbot, audio, tmp_path):
     b[50], b[100] = 0.5, -0.5
     result = compare(audio("a.wav", a), audio("b.wav", b), Options(strict=True))
     window.set_result(result)
+    marker = window.navigation_lines[0]
     window.next_difference(1)
-    qtbot.waitUntil(lambda: abs(window.cursors[0].value() - 50 / 8000) < 1e-8, timeout=5000)
+    qtbot.waitUntil(lambda: window.navigation_sample == 50, timeout=5000)
+    assert marker.isVisible() and marker.value() == pytest.approx(50 / 8000)
+    # A stopped player moves to the difference; later playback never moves the marker.
+    assert window.playback_position == pytest.approx(50 / 8000)
+    window.play_position(0.3)
+    assert marker.value() == pytest.approx(50 / 8000)
     window.next_difference(1)
-    qtbot.waitUntil(lambda: abs(window.cursors[0].value() - 100 / 8000) < 1e-8, timeout=5000)
+    qtbot.waitUntil(lambda: window.navigation_sample == 100, timeout=5000)
     window.next_difference(-1)
-    qtbot.waitUntil(lambda: abs(window.cursors[0].value() - 50 / 8000) < 1e-8, timeout=5000)
+    qtbot.waitUntil(lambda: window.navigation_sample == 50, timeout=5000)
+    window.next_difference(-1)
+    qtbot.waitUntil(lambda: not window.jobs.jobs, timeout=5000)
+    assert window.navigation_sample == 50
     window.jobs.cancel_all()
     qtbot.waitUntil(lambda: not window.jobs.jobs, timeout=5000)
     window.close()

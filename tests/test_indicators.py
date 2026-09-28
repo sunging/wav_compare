@@ -119,7 +119,9 @@ def test_spectrogram_uses_displayed_cell_and_unclipped_value(window, qtbot, audi
     assert query(window, qtbot, "spectrogram", point.x(), point.y()) == fields
     window.source.setCurrentIndex((source + 1) % 3)
     assert not probe.fields
-    assert window.spectral_data is None
+    # All sources were analyzed together: switching only swaps the displayed image.
+    assert window.spectral_data is not None and not window.jobs.jobs
+    np.testing.assert_array_equal(window.image.image, images[(source + 1) % 3])
 
 
 @pytest.mark.parametrize(
