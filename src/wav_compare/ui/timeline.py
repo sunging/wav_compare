@@ -16,6 +16,7 @@ class PlaybackTimeline(QtWidgets.QWidget):
         self.position = 0.0
         self.selection = (0.0, 0.0)
         self.seek_bounds = (0.0, 0.0)
+        self.overview = None
         self.interacting = False
         self._dragging = False
         self._edge = None
@@ -35,8 +36,14 @@ class PlaybackTimeline(QtWidgets.QWidget):
         self.position = 0.0
         self.selection = (0.0, self.duration)
         self.seek_bounds = (0.0, self.duration)
+        self.overview = None
         self.interacting = False
         self.setEnabled(self.duration > 0)
+        self.update()
+
+    def set_overview(self, bin_samples, values):
+        """Show normalized |B − A| per bin (0..1) as a heat strip on the track."""
+        self.overview = (bin_samples / self.rate, values) if len(values) else None
         self.update()
 
     def set_position(self, seconds):
@@ -147,6 +154,14 @@ class PlaybackTimeline(QtWidgets.QWidget):
         y = self.height() / 2
         painter.setPen(QtGui.QPen(self.track_color, 4))
         painter.drawLine(QtCore.QPointF(9, y), QtCore.QPointF(self.width() - 9, y))
+        if self.overview is not None:
+            seconds, values = self.overview
+            heat = QtGui.QColor("#e8612d")
+            for i in map(int, values.nonzero()[0]):
+                left = self.x_at(i * seconds)
+                right = self.x_at(min((i + 1) * seconds, self.duration))
+                heat.setAlphaF(0.25 + 0.75 * float(values[i]))
+                painter.fillRect(QtCore.QRectF(left, y - 3, max(1.0, right - left), 6), heat)
         lo, hi = (self.x_at(t) for t in self.selection)
         fill = QtGui.QColor(accent)
         fill.setAlpha(80)

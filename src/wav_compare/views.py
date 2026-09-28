@@ -57,6 +57,24 @@ def amplitude_ranges(result: Comparison, channel: int):
     )
 
 
+def difference_overview(result: Comparison, channel: int):
+    """Normalized |B − A| envelope over the whole result from the coarsest level (<=1024 bins).
+
+    Returns (bin_width_samples, values in 0..1); an all-zero difference gives zeros.
+    """
+    if not result.peaks:
+        return 1, np.zeros(0)
+    width, path, _ = result.peaks[-1]
+    peaks = np.load(path, mmap_mode="r")
+    try:
+        difference = np.array(peaks[:, channel, 2])
+    finally:
+        peaks._mmap.close()
+    values = np.abs(difference).max(axis=1)
+    maximum = float(values.max(initial=0.0))
+    return width, values / maximum if maximum > 0 else np.zeros_like(values)
+
+
 def waveform(result: Comparison, begin: float, end: float, channel: int, pixels: int):
     start = max(0, min(result.frames - 1, int(begin * result.rate)))
     stop = min(result.frames, max(start + 1, int(end * result.rate)))
