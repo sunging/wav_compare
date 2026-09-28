@@ -221,3 +221,15 @@ def test_difference_overview_and_timeline_strip(qtbot, window, audio):
     window.channel.setCurrentIndex(0)
     same = compare(audio("c.wav", a), audio("d.wav", a), Options(strict=True))
     assert not difference_overview(same, 0)[1].any()
+
+
+@pytest.mark.parametrize("theme", ["light", "dark"])
+def test_item_view_selection_uses_theme_colors_when_inactive(qtbot, window, theme):
+    # Style-sheet widgets rebuild their palette from the platform default, whose inactive
+    # highlight is near-white on Windows; selection colors must come from the theme.
+    window.theme_combo.setCurrentIndex(window.theme_combo.findData(theme))
+    for view in (window.table, window.metrics):
+        palette = view.palette()
+        for group in (QtGui.QPalette.Active, QtGui.QPalette.Inactive):
+            assert palette.color(group, QtGui.QPalette.Highlight).name() == "#277ab8"
+            assert palette.color(group, QtGui.QPalette.HighlightedText).name() == "#ffffff"

@@ -1596,6 +1596,8 @@ class Window(QtWidgets.QMainWindow):
             QLineEdit, QAbstractSpinBox, QComboBox, QPlainTextEdit, QTableWidget, QTreeWidget {{
                 background: {panel}; border: 1px solid {border}; border-radius: 4px; padding: 5px; }}
             QTableWidget, QTreeWidget {{ alternate-background-color: {bg}; }}
+            QLineEdit, QAbstractSpinBox, QComboBox, QPlainTextEdit, QTableWidget, QTreeWidget {{
+                selection-background-color: #277ab8; selection-color: #ffffff; }}
             QLineEdit[invalid="true"] {{ border: 1px solid #e5534b; }}
             QAbstractSpinBox:disabled, QComboBox:disabled, QLineEdit:disabled,
             QCheckBox:disabled, QLabel:disabled {{ color: {muted}; }}
