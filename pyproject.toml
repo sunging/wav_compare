@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "wav-compare"
-version = "0.0.0"
+version = "0.1.0"
 description = "A streaming, multichannel WAV comparison and audio analysis workbench"
 readme = "README.md"
 requires-python = ">=3.11"
